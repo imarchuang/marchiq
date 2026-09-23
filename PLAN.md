@@ -151,13 +151,16 @@ Default `acks=1` for demos; document the tradeoff in `DURABILITY.md`.
 
 ## Consumer groups (v0 — intentionally small)
 
-Kafka’s group coordinator is heavy. MVP rules:
+Kafka’s group coordinator is heavy. MVP rules (implemented in slice 4):
 
-1. **Static assignment:** `partitions = hash(member_id) % num_partitions` or
-   broker assigns all partitions to one member when `members == 1`.
-2. **One committed offset per (group, topic, partition)** in `meta/groups.json`.
-3. **No rebalance protocol** in slice 3 — second member joining returns 409 or
-   gets idle partitions only; full rebalance is slice 5.
+1. **Static assignment:** the first join declares the group size; members get an
+   ordinal by join order; partition `p` belongs to the member with
+   `ordinal == p % size`. No partition ever changes hands.
+2. **One committed offset per (group, topic, partition)** in `meta/groups.json`,
+   published with the same atomic protocol as the topic catalog
+   (tmp → sync → rename → sync dir).
+3. **No rebalance protocol** — a member beyond the declared size gets 409;
+   full rebalance is slice 5+.
 4. **At-least-once:** commit **after** processing; crash before commit → replay.
 
 This is enough to demo “two consumers, two partitions, no duplicate partition”.
@@ -293,9 +296,10 @@ for i in $(seq 1 20); do
   curl -X POST "localhost:9092/produce?topic=events&key=k$i" -d "payload-$i"
 done
 
-# terminal 4 — consumer group
-curl "localhost:9092/groups/workers/join?members=2"
-curl "localhost:9092/fetch?group=workers&topic=events&max_bytes=65536"
+# terminal 4 — consumer group (two members, static assignment)
+curl -X POST "localhost:9092/groups/workers/join?topic=events&member=w1&members=2"
+curl -X POST "localhost:9092/groups/workers/join?topic=events&member=w2&members=2"
+curl "localhost:9092/fetch?group=workers&topic=events&member=w1&max_bytes=65536"
 curl -X POST localhost:9092/commit -d '{"group":"workers","topic":"events","partition":0,"offset":9}'
 ```
 
@@ -332,8 +336,8 @@ another LSM.
 
 ## Success criteria (“MVP done”)
 
-- [ ] Single broker, multiple topics, multiple partitions
-- [ ] Produce → fetch → commit → restart → no duplicate past commit
+- [x] Single broker, multiple topics, multiple partitions
+- [x] Produce → fetch → commit → restart → no duplicate past commit
 - [ ] Segment roll + retention reclaim disk
 - [ ] `go test ./...` + Docker demo script documented
 - [ ] `DURABILITY.md` explains acks and why this is not LSM

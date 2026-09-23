@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -18,13 +19,17 @@ import (
 	"github.com/marchi/marchiq/storage"
 )
 
-const helpText = `marchiq — Slice 3: fetch by explicit offset
+const helpText = `marchiq — Slice 4: consumer groups + committed offsets
 POST /topics                      create topic, JSON body {"name":"events","partitions":2}
 GET  /topics                      list topics
 GET  /topics/{topic}/offsets      earliest/latest per partition
 POST /produce?topic=T&partition=P&key=K   append record; request body is the value
 GET  /fetch?topic=T&partition=P&offset=O&max_bytes=B&max_records=N
                                   read records from offset O; key/value are base64 in JSON
+GET  /fetch?group=G&topic=T&member=M      group mode: read from committed+1 on assigned partitions
+POST /groups/{group}/join?topic=T&member=M&members=N
+                                  join group (N = declared size, fixed by first join); returns static assignment
+POST /commit                      commit offset, JSON body {"group":"g","topic":"t","partition":0,"offset":9}
 GET  /debug/segments?topic=T&partition=P  list segment files + sizes
 GET  /healthz                     liveness
 `
@@ -44,6 +49,8 @@ func handler(api storage.BrokerAPI) http.Handler {
 	mux.HandleFunc("GET /topics/{topic}/offsets", topicOffsets(api))
 	mux.HandleFunc("POST /produce", produce(api))
 	mux.HandleFunc("GET /fetch", fetch(api))
+	mux.HandleFunc("POST /groups/{group}/join", joinGroup(api))
+	mux.HandleFunc("POST /commit", commitOffset(api))
 	mux.HandleFunc("GET /debug/segments", debugSegments(api))
 	return mux
 }
@@ -126,46 +133,193 @@ type fetchRecord struct {
 	Value       []byte `json:"value"`
 }
 
+// parseFetchBudget reads the optional max_bytes/max_records query params.
+func parseFetchBudget(q url.Values) (maxBytes int64, maxRecords int, err error) {
+	maxBytes, maxRecords = 1<<20, 1000 // 1 MiB / 1000 records default fetch budget
+	if s := q.Get("max_bytes"); s != "" {
+		v, e := strconv.ParseInt(s, 10, 64)
+		if e != nil || v <= 0 {
+			return 0, 0, fmt.Errorf("max_bytes must be a positive integer")
+		}
+		maxBytes = v
+	}
+	if s := q.Get("max_records"); s != "" {
+		v, e := strconv.Atoi(s)
+		if e != nil || v <= 0 {
+			return 0, 0, fmt.Errorf("max_records must be a positive integer")
+		}
+		maxRecords = v
+	}
+	return maxBytes, maxRecords, nil
+}
+
+// fetch dispatches: with a group param it is group mode (committed offsets),
+// otherwise explicit-offset mode (Slice 3 semantics unchanged).
 func fetch(api storage.BrokerAPI) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		topic, partStr, offStr := q.Get("topic"), q.Get("partition"), q.Get("offset")
-		if topic == "" || partStr == "" || offStr == "" {
-			writeErr(w, http.StatusBadRequest, "topic, partition and offset query params are required")
+		maxBytes, maxRecords, err := parseFetchBudget(q)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		partition, err := strconv.Atoi(partStr)
-		if err != nil || partition < 0 {
-			writeErr(w, http.StatusBadRequest, "partition must be a non-negative integer")
+		if group := q.Get("group"); group != "" {
+			fetchGroup(api, w, q.Get("topic"), group, q.Get("member"), maxRecords, maxBytes)
 			return
 		}
-		offset, err := strconv.ParseInt(offStr, 10, 64)
-		if err != nil || offset < 0 {
-			writeErr(w, http.StatusBadRequest, "offset must be a non-negative integer")
+		fetchExplicit(api, w, q.Get("topic"), q.Get("partition"), q.Get("offset"), maxRecords, maxBytes)
+	}
+}
+
+func fetchExplicit(api storage.BrokerAPI, w http.ResponseWriter, topic, partStr, offStr string, maxRecords int, maxBytes int64) {
+	if topic == "" || partStr == "" || offStr == "" {
+		writeErr(w, http.StatusBadRequest, "topic, partition and offset query params are required")
+		return
+	}
+	partition, err := strconv.Atoi(partStr)
+	if err != nil || partition < 0 {
+		writeErr(w, http.StatusBadRequest, "partition must be a non-negative integer")
+		return
+	}
+	offset, err := strconv.ParseInt(offStr, 10, 64)
+	if err != nil || offset < 0 {
+		writeErr(w, http.StatusBadRequest, "offset must be a non-negative integer")
+		return
+	}
+	recs, offs, err := api.Fetch(topic, partition, storage.Offset(offset), maxRecords, maxBytes)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrTopicNotFound), errors.Is(err, storage.ErrPartitionNotFound):
+			writeErr(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, storage.ErrOffsetOutOfRange):
+			writeErr(w, http.StatusBadRequest, err.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	next := offset
+	out := make([]fetchRecord, 0, len(recs))
+	for _, rec := range recs {
+		out = append(out, fetchRecord{
+			Offset: int64(rec.Offset), TimestampNS: rec.TimestampNS, Key: rec.Key, Value: rec.Value,
+		})
+		next = int64(rec.Offset) + 1
+	}
+	w.Header().Set("X-Marchiq-Records-Returned", strconv.Itoa(len(out)))
+	w.Header().Set("X-Marchiq-High-Watermark", strconv.FormatInt(int64(offs.Latest), 10))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"topic": topic, "partition": partition,
+		"records": out, "next_offset": next, "high_watermark": int64(offs.Latest),
+	})
+}
+
+// fetchGroup serves GET /fetch?group=G&topic=T[&member=M]: records from
+// committed_offset+1 on every partition statically assigned to the member.
+func fetchGroup(api storage.BrokerAPI, w http.ResponseWriter, topic, group, member string, maxRecords int, maxBytes int64) {
+	if topic == "" {
+		writeErr(w, http.StatusBadRequest, "topic query param is required")
+		return
+	}
+	parts, err := api.FetchGroup(group, topic, member, maxRecords, maxBytes)
+	if err != nil {
+		switch {
+		case errors.Is(err, storage.ErrGroupNotFound), errors.Is(err, storage.ErrTopicNotFound):
+			writeErr(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, storage.ErrMemberRequired):
+			writeErr(w, http.StatusBadRequest, err.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	type partitionResult struct {
+		Partition     int           `json:"partition"`
+		Records       []fetchRecord `json:"records"`
+		NextOffset    int64         `json:"next_offset"`
+		HighWatermark int64         `json:"high_watermark"`
+	}
+	out := make([]partitionResult, 0, len(parts))
+	total := 0
+	for _, p := range parts {
+		recs := make([]fetchRecord, 0, len(p.Records))
+		for _, rec := range p.Records {
+			recs = append(recs, fetchRecord{
+				Offset: int64(rec.Offset), TimestampNS: rec.TimestampNS, Key: rec.Key, Value: rec.Value,
+			})
+		}
+		total += len(recs)
+		out = append(out, partitionResult{
+			Partition: p.Partition, Records: recs,
+			NextOffset: int64(p.NextOffset), HighWatermark: int64(p.HighWatermark),
+		})
+	}
+	w.Header().Set("X-Marchiq-Records-Returned", strconv.Itoa(total))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"group": group, "member": member, "topic": topic, "partitions": out,
+	})
+}
+
+// joinGroup serves POST /groups/{group}/join?topic=T&member=M&members=N.
+// members (declared group size) defaults to 1 and is fixed by the first join;
+// member defaults to a generated id. Rejoining is idempotent.
+func joinGroup(api storage.BrokerAPI) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		topic := q.Get("topic")
+		if topic == "" {
+			writeErr(w, http.StatusBadRequest, "topic query param is required")
 			return
 		}
-		maxBytes := int64(1 << 20) // 1 MiB default fetch budget
-		if s := q.Get("max_bytes"); s != "" {
-			v, err := strconv.ParseInt(s, 10, 64)
-			if err != nil || v <= 0 {
-				writeErr(w, http.StatusBadRequest, "max_bytes must be a positive integer")
-				return
-			}
-			maxBytes = v
-		}
-		maxRecords := 1000
-		if s := q.Get("max_records"); s != "" {
+		size := 1
+		if s := q.Get("members"); s != "" {
 			v, err := strconv.Atoi(s)
-			if err != nil || v <= 0 {
-				writeErr(w, http.StatusBadRequest, "max_records must be a positive integer")
+			if err != nil || v < 1 {
+				writeErr(w, http.StatusBadRequest, "members must be a positive integer")
 				return
 			}
-			maxRecords = v
+			size = v
 		}
-		recs, offs, err := api.Fetch(topic, partition, storage.Offset(offset), maxRecords, maxBytes)
+		asg, err := api.JoinGroup(r.PathValue("group"), topic, q.Get("member"), size)
 		if err != nil {
 			switch {
-			case errors.Is(err, storage.ErrTopicNotFound), errors.Is(err, storage.ErrPartitionNotFound):
+			case errors.Is(err, storage.ErrGroupConflict):
+				writeErr(w, http.StatusConflict, err.Error())
+			case errors.Is(err, storage.ErrTopicNotFound):
+				writeErr(w, http.StatusNotFound, err.Error())
+			default:
+				writeErr(w, http.StatusBadRequest, err.Error())
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, asg)
+	}
+}
+
+type commitRequest struct {
+	Group     string `json:"group"`
+	Topic     string `json:"topic"`
+	Partition int    `json:"partition"`
+	Offset    int64  `json:"offset"`
+}
+
+// commitOffset serves POST /commit: the offset is the last PROCESSED record;
+// the next group fetch resumes at offset+1 (at-least-once).
+func commitOffset(api storage.BrokerAPI) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req commitRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		if req.Group == "" || req.Topic == "" {
+			writeErr(w, http.StatusBadRequest, "group and topic are required")
+			return
+		}
+		if err := api.CommitOffset(req.Group, req.Topic, req.Partition, storage.Offset(req.Offset)); err != nil {
+			switch {
+			case errors.Is(err, storage.ErrGroupNotFound),
+				errors.Is(err, storage.ErrTopicNotFound), errors.Is(err, storage.ErrPartitionNotFound):
 				writeErr(w, http.StatusNotFound, err.Error())
 			case errors.Is(err, storage.ErrOffsetOutOfRange):
 				writeErr(w, http.StatusBadRequest, err.Error())
@@ -174,19 +328,9 @@ func fetch(api storage.BrokerAPI) http.HandlerFunc {
 			}
 			return
 		}
-		next := offset
-		out := make([]fetchRecord, 0, len(recs))
-		for _, rec := range recs {
-			out = append(out, fetchRecord{
-				Offset: int64(rec.Offset), TimestampNS: rec.TimestampNS, Key: rec.Key, Value: rec.Value,
-			})
-			next = int64(rec.Offset) + 1
-		}
-		w.Header().Set("X-Marchiq-Records-Returned", strconv.Itoa(len(out)))
-		w.Header().Set("X-Marchiq-High-Watermark", strconv.FormatInt(int64(offs.Latest), 10))
 		writeJSON(w, http.StatusOK, map[string]any{
-			"topic": topic, "partition": partition,
-			"records": out, "next_offset": next, "high_watermark": int64(offs.Latest),
+			"group": req.Group, "topic": req.Topic, "partition": req.Partition,
+			"committed": req.Offset, "next_offset": req.Offset + 1,
 		})
 	}
 }
