@@ -8,12 +8,12 @@
 | `GET /`、`GET /healthz` | 已实现 |
 | Record v1 编解码、长度上限、EOF 分类 | 已实现，有单测及 fuzz target |
 | TopicConfig 校验、catalog JSON envelope | 类型及校验已实现 |
-| Broker → Topic → PartitionLog → Segment | 字段草图，没有存储方法实现 |
-| CreateTopic / Produce / GetOffsets / Close | 只有 BrokerAPI 接口契约 |
-| topic HTTP、catalog 原子保存、重启扫描 | 待实现 |
+| Broker → Topic → PartitionLog → Segment | 已实现（Slice 1 单 segment） |
+| CreateTopic / Produce / GetOffsets / Close | 已实现，含 catalog 原子发布与重启扫描 |
+| topic HTTP（POST /topics、GET /topics、GET /topics/{t}/offsets、POST /produce） | 已实现 |
 | torn-tail 修复、index、roll、fetch HTTP、groups | 后续 slice |
 
-不会用返回 nil 的占位方法伪装功能完成。当前 `/produce`、`/topics` 返回 404。
+不会用返回 nil 的占位方法伪装功能完成。`/fetch`、`/commit`、`/groups` 仍返回 404。
 
 ## 数据所有权
 
@@ -38,9 +38,9 @@ Broker
 Broker 锁用于短暂查找和 catalog 更新，不要覆盖所有 partition 的 fsync。
 Close 与并发操作的生命周期协议还需实现，不能直接在活跃请求中关闭文件。
 
-## Slice 1 下一步的方法草图
+## Slice 1 方法（已实现）
 
-以下是实施顺序，不是现有可调用 API：
+以下是 Slice 1 实际落地的 API（`topic.go` / `partition_log.go`）：
 
 ```go
 // topic.go
