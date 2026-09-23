@@ -12,9 +12,10 @@
 | CreateTopic / Produce / GetOffsets / Close | 已实现，含 catalog 原子发布与重启扫描 |
 | topic HTTP（POST /topics、GET /topics、GET /topics/{t}/offsets、POST /produce） | 已实现 |
 | segment roll、稀疏 .index、active 段 torn-tail 截断、GET /debug/segments | 已实现（Slice 2） |
-| fetch HTTP、consumer groups、retention | 后续 slice |
+| GET /fetch（显式 offset、max_bytes、next_offset、HWM header） | 已实现（Slice 3） |
+| consumer groups（/commit、/groups）、retention | 后续 slice |
 
-不会用返回 nil 的占位方法伪装功能完成。`/fetch`、`/commit`、`/groups` 仍返回 404。
+不会用返回 nil 的占位方法伪装功能完成。`/commit`、`/groups` 仍返回 404。
 
 ## 数据所有权
 

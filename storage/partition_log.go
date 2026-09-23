@@ -250,9 +250,12 @@ func (p *PartitionLog) Offsets() (Offsets, error) {
 }
 
 // ReadFrom returns up to maxRecords records with offset >= the requested one,
-// spanning segment boundaries. The sparse index seeks to the nearest indexed
-// record at or before the target, so the scan costs O(interval), not O(N).
-func (p *PartitionLog) ReadFrom(offset Offset, maxRecords int) ([]Record, error) {
+// spanning segment boundaries, stopping once maxBytes of frame data would be
+// exceeded — but always returns at least one record (Kafka's max_bytes rule:
+// a single record larger than the limit is still delivered). The sparse index
+// seeks to the nearest indexed record at or before the target, so the scan
+// costs O(interval), not O(N).
+func (p *PartitionLog) ReadFrom(offset Offset, maxRecords int, maxBytes int64) ([]Record, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.closed {
@@ -261,6 +264,9 @@ func (p *PartitionLog) ReadFrom(offset Offset, maxRecords int) ([]Record, error)
 	if maxRecords <= 0 {
 		return nil, fmt.Errorf("maxRecords must be > 0")
 	}
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("maxBytes must be > 0")
+	}
 	if offset < 0 || offset > p.nextOffset {
 		return nil, fmt.Errorf("%w: %d not in [0, %d]", ErrOffsetOutOfRange, offset, p.nextOffset)
 	}
@@ -268,6 +274,7 @@ func (p *PartitionLog) ReadFrom(offset Offset, maxRecords int) ([]Record, error)
 	if offset == p.nextOffset { // at LEO: empty, not an error
 		return out, nil
 	}
+	var totalBytes int64
 	si := sort.Search(len(p.segments), func(i int) bool {
 		s := p.segments[i]
 		return s.baseOffset+Offset(s.records) > offset
@@ -283,12 +290,16 @@ func (p *PartitionLog) ReadFrom(offset Offset, maxRecords int) ([]Record, error)
 		end := seg.baseOffset + Offset(seg.records)
 		reader := io.NewSectionReader(seg.file, entry.position, seg.sizeBytes-entry.position)
 		for cur < end && len(out) < maxRecords {
-			r, _, err := DecodeRecord(reader, cur)
+			r, n, err := DecodeRecord(reader, cur)
 			if err != nil {
 				return nil, fmt.Errorf("rescan offset %d: %w", cur, err)
 			}
 			if cur >= start {
+				if len(out) > 0 && totalBytes+int64(n) > maxBytes {
+					return out, nil
+				}
 				out = append(out, r)
+				totalBytes += int64(n)
 			}
 			cur++
 		}

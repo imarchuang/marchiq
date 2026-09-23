@@ -65,6 +65,11 @@ func openTestPartition(t *testing.T, dir string) *PartitionLog {
 	return p
 }
 
+// readAll reads without a byte limit (the common case for older tests).
+func readAll(p *PartitionLog, offset Offset, maxRecords int) ([]Record, error) {
+	return p.ReadFrom(offset, maxRecords, math.MaxInt64)
+}
+
 // Acceptance: append 3 records, LEO=3, records readable by offset.
 func TestAppendAndReadBack(t *testing.T) {
 	p := newTestPartition(t, nil)
@@ -78,23 +83,23 @@ func TestAppendAndReadBack(t *testing.T) {
 	if err != nil || off != (Offsets{Earliest: 0, Latest: 3}) {
 		t.Fatalf("%+v %v", off, err)
 	}
-	recs, err := p.ReadFrom(1, 10)
+	recs, err := readAll(p, 1, 10)
 	if err != nil || len(recs) != 2 || recs[0].Offset != 1 || string(recs[1].Value) != "three" {
 		t.Fatalf("%+v %v", recs, err)
 	}
-	if recs, err = p.ReadFrom(3, 10); err != nil || len(recs) != 0 {
+	if recs, err = readAll(p, 3, 10); err != nil || len(recs) != 0 {
 		t.Fatalf("at LEO: %+v %v", recs, err)
 	}
-	if _, err = p.ReadFrom(-1, 1); !errors.Is(err, ErrOffsetOutOfRange) {
+	if _, err = readAll(p, -1, 1); !errors.Is(err, ErrOffsetOutOfRange) {
 		t.Fatal(err)
 	}
-	if _, err = p.ReadFrom(4, 1); !errors.Is(err, ErrOffsetOutOfRange) {
+	if _, err = readAll(p, 4, 1); !errors.Is(err, ErrOffsetOutOfRange) {
 		t.Fatal(err)
 	}
-	if _, err = p.ReadFrom(0, 0); err == nil {
+	if _, err = readAll(p, 0, 0); err == nil {
 		t.Fatal("maxRecords=0 accepted")
 	}
-	if recs, err = p.ReadFrom(0, 2); err != nil || len(recs) != 2 || recs[1].Offset != 1 {
+	if recs, err = readAll(p, 0, 2); err != nil || len(recs) != 2 || recs[1].Offset != 1 {
 		t.Fatalf("maxRecords: %+v %v", recs, err)
 	}
 }
@@ -129,7 +134,7 @@ func TestAppendConcurrent(t *testing.T) {
 	if off, _ := p.Offsets(); off.Latest != n {
 		t.Fatalf("LEO=%d", off.Latest)
 	}
-	recs, err := p.ReadFrom(0, n)
+	recs, err := readAll(p, 0, n)
 	if err != nil || len(recs) != n {
 		t.Fatalf("%d %v", len(recs), err)
 	}
@@ -162,7 +167,7 @@ func TestReopenContinuesOffset(t *testing.T) {
 	if err != nil || r.Offset != 3 {
 		t.Fatalf("%+v %v", r, err)
 	}
-	recs, err := p2.ReadFrom(0, 10)
+	recs, err := readAll(p2, 0, 10)
 	if err != nil || len(recs) != 4 || string(recs[3].Value) != "after-reopen" {
 		t.Fatalf("%+v %v", recs, err)
 	}
@@ -242,7 +247,7 @@ func TestOpenPartitionTruncatesTornTail(t *testing.T) {
 	if err != nil || r.Offset != 3 {
 		t.Fatalf("%+v %v", r, err)
 	}
-	recs, err := p2.ReadFrom(0, 10)
+	recs, err := readAll(p2, 0, 10)
 	if err != nil || len(recs) != 4 || string(recs[3].Value) != "continues" {
 		t.Fatalf("%+v %v", recs, err)
 	}
@@ -339,11 +344,49 @@ func TestCloseFencesOperations(t *testing.T) {
 	if _, err := p.Offsets(); !errors.Is(err, ErrClosed) {
 		t.Fatalf("err=%v", err)
 	}
-	if _, err := p.ReadFrom(0, 1); !errors.Is(err, ErrClosed) {
+	if _, err := readAll(p, 0, 1); !errors.Is(err, ErrClosed) {
 		t.Fatalf("err=%v", err)
 	}
 	if err := p.Close(); err != nil { // idempotent
 		t.Fatal(err)
+	}
+}
+
+// Slice 3: maxBytes caps the frame bytes returned, but at least one record is
+// always delivered even when a single frame exceeds the budget.
+func TestReadFromMaxBytes(t *testing.T) {
+	p := newTestPartition(t, nil)
+	for i := 0; i < 10; i++ {
+		if _, err := p.Append(nil, []byte("v")); err != nil { // 23-byte frames
+			t.Fatal(err)
+		}
+	}
+	recs, err := p.ReadFrom(0, 100, 50) // 2 frames fit (46B), 3rd would exceed
+	if err != nil || len(recs) != 2 || recs[1].Offset != 1 {
+		t.Fatalf("%+v %v", recs, err)
+	}
+	recs, err = p.ReadFrom(0, 100, 1) // budget smaller than one frame: still one record
+	if err != nil || len(recs) != 1 || recs[0].Offset != 0 {
+		t.Fatalf("%+v %v", recs, err)
+	}
+	if _, err = p.ReadFrom(0, 100, 0); err == nil {
+		t.Fatal("maxBytes=0 accepted")
+	}
+	// Byte limit across a segment boundary.
+	p.maxSegmentBytes = 60 // ~2 frames per segment
+	q := newTestPartition(t, nil)
+	q.maxSegmentBytes = 60
+	for i := 0; i < 6; i++ {
+		if _, err := q.Append(nil, []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recs, err = q.ReadFrom(0, 100, 70) // 3 frames (69B), spans into segment 2
+	if err != nil || len(recs) != 3 || recs[2].Offset != 2 {
+		t.Fatalf("%+v %v", recs, err)
+	}
+	if len(q.segments) < 2 {
+		t.Fatal("expected the byte-limited read to span segments")
 	}
 }
 
@@ -393,7 +436,7 @@ func TestReadFromSpansSegments(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	recs, err := p.ReadFrom(0, 100)
+	recs, err := readAll(p, 0, 100)
 	if err != nil || len(recs) != 10 {
 		t.Fatalf("%d %v", len(recs), err)
 	}
@@ -403,12 +446,12 @@ func TestReadFromSpansSegments(t *testing.T) {
 		}
 	}
 	// Start mid-segment, cross into the next.
-	recs, err = p.ReadFrom(3, 4)
+	recs, err = readAll(p, 3, 4)
 	if err != nil || len(recs) != 4 || recs[0].Offset != 3 || recs[3].Offset != 6 {
 		t.Fatalf("%+v %v", recs, err)
 	}
 	// Start exactly at a segment base.
-	recs, err = p.ReadFrom(4, 2)
+	recs, err = readAll(p, 4, 2)
 	if err != nil || len(recs) != 2 || recs[0].Offset != 4 {
 		t.Fatalf("%+v %v", recs, err)
 	}
@@ -491,7 +534,7 @@ func TestReopenMultiSegment(t *testing.T) {
 	if err != nil || r.Offset != 10 {
 		t.Fatalf("%+v %v", r, err)
 	}
-	recs, err := p2.ReadFrom(0, 100)
+	recs, err := readAll(p2, 0, 100)
 	if err != nil || len(recs) != 11 {
 		t.Fatalf("%d %v", len(recs), err)
 	}
@@ -522,7 +565,7 @@ func TestConcurrentAppendWithRoll(t *testing.T) {
 	if off, _ := p.Offsets(); off.Latest != n {
 		t.Fatalf("LEO=%d", off.Latest)
 	}
-	recs, err := p.ReadFrom(0, n)
+	recs, err := readAll(p, 0, n)
 	if err != nil || len(recs) != n {
 		t.Fatalf("%d %v", len(recs), err)
 	}

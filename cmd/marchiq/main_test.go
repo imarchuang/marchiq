@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -135,5 +137,79 @@ func TestProduceAndOffsetsAPI(t *testing.T) {
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/debug/segments?topic=ghost&partition=0", nil))
 	if w.Code != 404 {
 		t.Fatalf("unknown topic segments: %d", w.Code)
+	}
+}
+
+// Slice 3 acceptance: produce 100 messages, fetch from offset 50, get 50.
+func TestFetchAPI(t *testing.T) {
+	h := testHandler(t)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/topics", strings.NewReader(`{"name":"events","partitions":1}`)))
+	if w.Code != 201 {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	for i := 0; i < 100; i++ {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", "/produce?topic=events&partition=0", strings.NewReader(fmt.Sprintf("payload-%d", i))))
+		if w.Code != 200 {
+			t.Fatalf("produce %d: %d", i, w.Code)
+		}
+	}
+	fetch := func(path string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		return w
+	}
+	w = fetch("/fetch?topic=events&partition=0&offset=50")
+	if w.Code != 200 {
+		t.Fatalf("fetch: %d %s", w.Code, w.Body)
+	}
+	var resp struct {
+		Records       []fetchRecord `json:"records"`
+		NextOffset    int64         `json:"next_offset"`
+		HighWatermark int64         `json:"high_watermark"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Records) != 50 || resp.Records[0].Offset != 50 || resp.NextOffset != 100 || resp.HighWatermark != 100 {
+		t.Fatalf("records=%d next=%d hwm=%d", len(resp.Records), resp.NextOffset, resp.HighWatermark)
+	}
+	if got := w.Header().Get("X-Marchiq-Records-Returned"); got != "50" {
+		t.Fatalf("header=%s", got)
+	}
+	// On the wire the value is base64 (JSON []byte); the struct above already
+	// holds the decoded bytes.
+	if string(resp.Records[0].Value) != "payload-50" {
+		t.Fatalf("value %q", resp.Records[0].Value)
+	}
+	if !strings.Contains(w.Body.String(), base64.StdEncoding.EncodeToString([]byte("payload-50"))) {
+		t.Fatalf("wire value not base64: %s", w.Body.String())
+	}
+	// Empty poll at LEO: 200 with records: [].
+	w = fetch("/fetch?topic=events&partition=0&offset=100")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"records":[]`) {
+		t.Fatalf("empty poll: %d %s", w.Code, w.Body)
+	}
+	// Out of range / unknown topic / missing params.
+	if w := fetch("/fetch?topic=events&partition=0&offset=101"); w.Code != 400 {
+		t.Fatalf("out of range: %d", w.Code)
+	}
+	if w := fetch("/fetch?topic=ghost&partition=0&offset=0"); w.Code != 404 {
+		t.Fatalf("unknown topic: %d", w.Code)
+	}
+	if w := fetch("/fetch?topic=events&partition=0"); w.Code != 400 {
+		t.Fatalf("missing offset: %d", w.Code)
+	}
+	// max_bytes caps the response.
+	w = fetch("/fetch?topic=events&partition=0&offset=0&max_bytes=100")
+	if w.Code != 200 {
+		t.Fatalf("max_bytes: %d", w.Code)
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Records) == 0 || len(resp.Records) >= 10 {
+		t.Fatalf("max_bytes=100 returned %d records", len(resp.Records))
 	}
 }
