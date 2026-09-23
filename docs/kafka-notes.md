@@ -1,8 +1,9 @@
-# Kafka 机制笔记：micro-batching 与 producer 侧 metadata
+# Kafka 机制笔记：micro-batching、producer metadata 与 group fencing
 
-这份文档记录两个理解 Kafka 设计的关键机制：**micro-batching**（攒批）和
-**producer 侧 metadata**（客户端路由）。它们解释了 Kafka 客户端那些"奇怪"
-配置项的存在理由，也标出了 marchiq 刻意简化掉的复杂度在哪里。
+这份文档记录三个理解 Kafka 设计的关键机制：**micro-batching**（攒批）、
+**producer 侧 metadata**（客户端路由）和 **consumer group 协调**（membership
+与 fencing）。它们解释了 Kafka 客户端/协议那些"奇怪"设计的存在理由，也标出
+了 marchiq 刻意简化掉的复杂度在哪里。
 
 ---
 
@@ -163,3 +164,74 @@ cross-broker placement 明确推迟，砍掉的就是这一整块：controller �
 法做 per-partition 攒批。若将来写"胖客户端"（先 `GET /topics` 拿分区数，本地
 hash，按分区缓冲，批量发送），就把 Kafka 的客户端分区 + micro-batching 完整
 复刻了 —— 而 broker 的 HTTP API 一个字符都不用改。
+
+---
+
+## 3. Consumer group 协调：fencing 防的是僵尸，不是恶意者
+
+### 分配是协调协议，不是访问控制
+
+直觉上容易以为"group 的分配结果是一种权限：member 只能读分给自己的分区"。
+Kafka 里恰恰相反 —— **group 协议管的是正确性协调，安全在另一层**：
+
+- **membership 协议**：consumer 用 `JoinGroup` 加入，member.id 由 broker
+  （group coordinator）下发；之后靠周期心跳维持会话（`session.timeout.ms`，
+  默认 45s），停止心跳即被判定死亡并触发 rebalance。
+- **generation fencing**：每次 rebalance 把 group 的 generation +1。
+  `OffsetCommit` 等写路径请求携带 generation；旧 generation 的请求被明确拒绝
+  （`UNKNOWN_MEMBER_ID` / `REBALANCE_IN_PROGRESS`；static membership 下是
+  `FENCED_INSTANCE_ID`）。
+- **但 Fetch 不校验 membership**：普通拉取请求不检查"你是不是这个 group 的
+  member、这个分区是不是分给了你"。读任何分区都不需要先有分配。
+
+为什么 fencing 只守写路径不守读路径？因为**重复读最多造成重复处理**（
+at-least-once 语义本来就允许，下游幂等可解），而 **commit 污染会让整个 group
+的消费进度错乱** —— 旧 member 把 offset 往回拨或往前跳，其他 member 的光标
+全废。fencing 守住的是 offset 的写入口。
+
+### 僵尸场景：fencing 到底在防什么
+
+协议要防的现实威胁不是恶意攻击者，而是**僵尸** —— 一个 GC 卡顿或网络分区后
+还以为自己活着的 consumer：
+
+```text
+t0  member m1 持有 partition-0（generation 5）
+t1  m1 GC 卡顿 30s，心跳全部错过（session.timeout.ms = 10s）
+t2  coordinator 判定 m1 死亡 → rebalance → generation 6，partition-0 分给 m2
+t3  m1 从 GC 中醒来，以为自己还是 owner，继续处理并 commit offset
+    → commit 携带 generation 5 → broker 拒绝（UNKNOWN_MEMBER_ID）
+t4  只有 m2 的 commit（generation 6）能成功 → partition-0 的进度不被污染
+```
+
+没有 fencing 的话，t3 的 commit 会覆盖 m2 的进度：已处理的消息被跳过、或已
+跳过的消息被重放 —— 而且静默发生，没有任何报错。
+
+### 为什么这套东西不防恶意者
+
+member.id 虽由 broker 下发，但**没有不可伪造性**：无认证环境下任何人都能
+`JoinGroup` 领一个合法 member.id，也能直接发 Fetch 读任何分区。整个 group 协
+议假设参与者是可信的，它只解决"**过期的**可信者不能捣乱"。
+
+真正的安全边界是另外两层，与 group 协议正交：
+
+| 层 | 机制 | 防什么 |
+|---|---|---|
+| 认证 | SASL / mTLS | 你是谁（防冒名） |
+| 授权 | topic 级 ACL（read/write/describe） | 你能碰哪个 topic（防越权） |
+
+### marchiq 对照
+
+v0 把两层都明确 defer 了，而且比 Kafka 更"裸"：
+
+- **member id 是自报的**（`member=m1` 只是个 query param），无 broker 下发、
+  无心跳、无会话、无 generation。冒名没有任何成本。
+- **显式 offset 路径完全敞开**：`GET /fetch?topic=T&partition=P&offset=O` 不
+  经过 group 机制 —— group 是协调便利，不是访问控制。
+- **静态分配下僵尸的表现**值得记住：member 真死 → 它名下的分区停滞（lag 增
+  长）但**不会重复**；假死（网络分区后旧进程还活着）→ 两个进程读同一分区 →
+  重复处理。at-least-once 容忍重复，但由于 commit 无 fencing，僵尸可以污染
+  group 的 committed offset —— 这正是 slice 5+ 若做 rebalance/动态 membership
+  时必须引入 generation 的原因。
+
+安全（认证 + ACL）与教育 MVP 的定位无关，继续 defer；但"协调 ≠ 安全"这个区
+分本身就是要学的一课。
