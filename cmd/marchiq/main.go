@@ -19,8 +19,13 @@ import (
 	"github.com/marchi/marchiq/storage"
 )
 
-const helpText = `marchiq — Slice 4: consumer groups + committed offsets
-POST /topics                      create topic, JSON body {"name":"events","partitions":2}
+const helpText = `marchiq — Slice 5: retention (per-topic retention_ms / retention_bytes, clamped by group commits)
+POST /topics                      create topic, JSON body {"name":"events","partitions":2,
+                                  "retention_ms":3600000,"retention_bytes":1073741824}
+                                  retention fields optional, zero = unlimited; a background
+                                  janitor deletes sealed segments older than retention_ms or
+                                  over retention_bytes, but never offsets a joined group
+                                  still needs (min committed+1) and never the active segment
 GET  /topics                      list topics
 GET  /topics/{topic}/offsets      earliest/latest per partition
 POST /produce?topic=T&partition=P&key=K   append record; request body is the value
@@ -409,12 +414,14 @@ func run() error {
 	addr := flag.String("addr", ":9092", "HTTP listen address")
 	segmentBytes := flag.Int64("segmentBytes", storage.DefaultMaxSegmentBytes, "roll active segment beyond this size")
 	indexInterval := flag.Int64("indexIntervalBytes", storage.DefaultIndexIntervalBytes, "sparse index entry per this many bytes")
+	retentionCheck := flag.Duration("retentionCheckInterval", storage.DefaultRetentionCheckInterval, "how often the retention janitor deletes expired sealed segments")
 	flag.Parse()
 	broker, err := storage.OpenWithConfig(*dataDir, *segmentBytes, *indexInterval)
 	if err != nil {
 		return err
 	}
 	defer broker.Close()
+	broker.SetRetentionInterval(*retentionCheck)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	server := &http.Server{Addr: *addr, Handler: handler(broker), ReadHeaderTimeout: 5 * time.Second}

@@ -211,11 +211,30 @@ Each slice = branch + tests + `docker compose` still works.
 
 ### Slice 5 — retention
 
-- Per-topic `retention.ms` and/or `retention.bytes`
-- Background ticker deletes sealed segments; **never** delete offset still needed
-  by any group’s committed offset (clamp to min committed)
+- Per-topic `retention_ms` and/or `retention_bytes` (catalog stays v1; zero =
+  unlimited; catalogs written before this slice keep loading)
+- Background ticker (`-retentionCheckInterval`, default 30s) deletes **sealed**
+  segments; the active segment is never a candidate, even if it alone exceeds
+  the size budget. `Broker.EnforceRetention()` is the deterministic single pass
+  the ticker and the tests both drive.
+- **Clamp:** never delete offsets still needed by any group joined to the
+  topic. Per partition the deletable boundary is min over joined groups of
+  (committed+1); a joined group that never committed contributes 0 (its next
+  read is offset 0, so nothing is deletable); no joined group = no clamp.
+- Age = sealed `.log` mtime (≈ seal time; index rebuilds never touch it, so it
+  survives restarts). Size = delete oldest-first until the partition is back
+  under budget. Deletion unlinks `.log` + `.index` and syncs the partition
+  directory — durable deletes, same discipline as the atomic-publish protocol.
+- `earliest` advances to the first surviving segment's base. Explicit `Fetch`
+  below earliest → `ErrOffsetOutOfRange` (Kafka behavior); `FetchGroup` clamps
+  its start up to earliest (auto.offset.reset=earliest) — only reachable by a
+  group that joined after the deletion with no commits.
 
-**Tests:** 1s retention, wait, earliest offset advances.
+**Tests:** aged sealed segments deleted and earliest advances (no sleep —
+`os.Chtimes` backdates mtimes); group clamp holds the segment containing
+committed+1; min across groups; uncommitted group blocks all; byte budget
+deletes oldest-first and keeps the active segment; restart preserves earliest
+and late-joining groups start at earliest; fetch below earliest rejected.
 
 ### Slice 6 — polish (optional before “MVP done”)
 
@@ -338,7 +357,7 @@ another LSM.
 
 - [x] Single broker, multiple topics, multiple partitions
 - [x] Produce → fetch → commit → restart → no duplicate past commit
-- [ ] Segment roll + retention reclaim disk
+- [x] Segment roll + retention reclaim disk
 - [ ] `go test ./...` + Docker demo script documented
 - [ ] `DURABILITY.md` explains acks and why this is not LSM
 

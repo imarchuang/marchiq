@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"time"
 )
 
 var (
@@ -55,7 +56,10 @@ type Record struct {
 type TopicConfig struct {
 	Name       string `json:"name"`
 	Partitions int    `json:"partitions"`
-	// Retention options are intentionally deferred until Slice 5.
+	// Retention (Slice 5): zero means unlimited. omitempty keeps catalogs
+	// written before Slice 5 byte-compatible in both directions.
+	RetentionMS    int64 `json:"retention_ms,omitempty"`
+	RetentionBytes int64 `json:"retention_bytes,omitempty"`
 }
 
 var topicName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,248}$`)
@@ -66,6 +70,9 @@ func (c TopicConfig) Validate() error {
 	}
 	if c.Partitions < 1 || c.Partitions > 1024 {
 		return fmt.Errorf("partitions must be in [1, 1024]")
+	}
+	if c.RetentionMS < 0 || c.RetentionBytes < 0 {
+		return fmt.Errorf("retention must be >= 0")
 	}
 	return nil
 }
@@ -115,6 +122,17 @@ type Broker struct {
 
 	maxSegmentBytes    int64 // roll threshold, from Open defaults
 	indexIntervalBytes int64 // sparse index density
+
+	// Retention janitor (Slice 5). retentionInterval is guarded by mu; the
+	// loop re-reads it each tick so SetRetentionInterval takes effect without
+	// restarting the broker. retentionKick is replaced+closed by the setter
+	// so a pending wait re-times immediately instead of finishing the old
+	// interval. retentionStop + retentionWg let Close stop the goroutine
+	// before any segment file is closed.
+	retentionInterval time.Duration
+	retentionKick     chan struct{}
+	retentionStop     chan struct{}
+	retentionWg       sync.WaitGroup
 }
 
 type Topic struct {

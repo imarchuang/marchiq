@@ -69,6 +69,36 @@ func TestTopicsAPI(t *testing.T) {
 	}
 }
 
+// Slice 5: POST /topics accepts retention_ms / retention_bytes and echoes
+// them; negative values are rejected.
+func TestCreateTopicWithRetentionAPI(t *testing.T) {
+	h := testHandler(t)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/topics",
+		strings.NewReader(`{"name":"events","partitions":1,"retention_ms":3600000,"retention_bytes":1073741824}`)))
+	if w.Code != 201 {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	var cfg storage.TopicConfig
+	if err := json.Unmarshal(w.Body.Bytes(), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RetentionMS != 3600000 || cfg.RetentionBytes != 1073741824 {
+		t.Fatalf("%+v", cfg)
+	}
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/topics", nil))
+	if !strings.Contains(w.Body.String(), `"retention_ms":3600000`) {
+		t.Fatalf("list: %s", w.Body)
+	}
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/topics",
+		strings.NewReader(`{"name":"neg","partitions":1,"retention_ms":-5}`)))
+	if w.Code != 400 {
+		t.Fatalf("negative retention: %d %s", w.Code, w.Body)
+	}
+}
+
 func TestProduceAndOffsetsAPI(t *testing.T) {
 	h := testHandler(t)
 	w := httptest.NewRecorder()
