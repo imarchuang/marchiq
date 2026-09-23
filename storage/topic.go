@@ -44,6 +44,9 @@ func OpenWithConfig(dataDir string, maxSegmentBytes, indexIntervalBytes int64) (
 		groups:             groups,
 		maxSegmentBytes:    maxSegmentBytes,
 		indexIntervalBytes: indexIntervalBytes,
+		retentionInterval:  DefaultRetentionCheckInterval,
+		retentionKick:      make(chan struct{}),
+		retentionStop:      make(chan struct{}),
 	}
 	for _, cfg := range meta.Topics {
 		t, err := b.openTopic(cfg)
@@ -53,6 +56,10 @@ func OpenWithConfig(dataDir string, maxSegmentBytes, indexIntervalBytes int64) (
 		}
 		b.topics[cfg.Name] = t
 	}
+	// The janitor starts only after every partition opened cleanly, so it can
+	// never run against a half-constructed broker.
+	b.retentionWg.Add(1)
+	go b.retentionLoop()
 	return b, nil
 }
 
@@ -227,9 +234,10 @@ func (b *Broker) DescribeSegments(topic string, partition int) ([]SegmentInfo, e
 	return p.DescribeSegments()
 }
 
-// Close marks the broker closed, then closes each partition. Partition locks
-// serialize this against in-flight appends; new operations see ErrClosed.
-// gmu is taken so group operations observe closed under the same lock they check.
+// Close marks the broker closed, stops the retention janitor, then closes each
+// partition. Partition locks serialize this against in-flight appends; new
+// operations see ErrClosed. gmu is taken so group operations observe closed
+// under the same lock they check.
 func (b *Broker) Close() error {
 	b.mu.Lock()
 	b.gmu.Lock()
@@ -242,6 +250,11 @@ func (b *Broker) Close() error {
 	topics := b.topics
 	b.gmu.Unlock()
 	b.mu.Unlock()
+	// Stop the janitor before closing segment files. An in-flight pass holds
+	// only partition locks (never mu/gmu while waiting here), so this cannot
+	// deadlock; after Wait returns no retention work is running.
+	close(b.retentionStop)
+	b.retentionWg.Wait()
 	var errs []error
 	for _, t := range topics {
 		for _, p := range t.partitions {

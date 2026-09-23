@@ -219,6 +219,14 @@ func (b *Broker) FetchGroup(group, topic, member string, maxRecords int, maxByte
 		if c, ok := committed[pi]; ok {
 			start = c + 1
 		}
+		if start < off.Earliest {
+			// Retention already reclaimed everything below earliest. This can
+			// only happen for a group that joined after the deletion with no
+			// commits (the retention clamp protects every joined group's
+			// cursor): start at the oldest surviving record —
+			// auto.offset.reset=earliest semantics.
+			start = off.Earliest
+		}
 		if start > off.Latest { // defensive: committed never exceeds LEO-1
 			start = off.Latest
 		}

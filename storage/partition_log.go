@@ -238,8 +238,9 @@ func (p *PartitionLog) rollLocked() error {
 	return nil
 }
 
-// Offsets returns the half-open readable range [earliest, LEO). Until
-// retention lands in Slice 5, earliest is always the first segment's base (0).
+// Offsets returns the half-open readable range [earliest, LEO). Earliest is
+// the first SURVIVING segment's base: retention (Slice 5) advances it by
+// deleting sealed segments, and a restart rebuilds it from the logs on disk.
 func (p *PartitionLog) Offsets() (Offsets, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -254,7 +255,10 @@ func (p *PartitionLog) Offsets() (Offsets, error) {
 // exceeded — but always returns at least one record (Kafka's max_bytes rule:
 // a single record larger than the limit is still delivered). The sparse index
 // seeks to the nearest indexed record at or before the target, so the scan
-// costs O(interval), not O(N).
+// costs O(interval), not O(N). An offset below earliest is out of range, not
+// silently clamped: retention already deleted those records, and pretending
+// otherwise would hide data loss from an explicit-offset reader (Kafka's
+// behavior too). Group fetches clamp to earliest one level up.
 func (p *PartitionLog) ReadFrom(offset Offset, maxRecords int, maxBytes int64) ([]Record, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -267,8 +271,9 @@ func (p *PartitionLog) ReadFrom(offset Offset, maxRecords int, maxBytes int64) (
 	if maxBytes <= 0 {
 		return nil, fmt.Errorf("maxBytes must be > 0")
 	}
-	if offset < 0 || offset > p.nextOffset {
-		return nil, fmt.Errorf("%w: %d not in [0, %d]", ErrOffsetOutOfRange, offset, p.nextOffset)
+	earliest := p.segments[0].baseOffset
+	if offset < earliest || offset > p.nextOffset {
+		return nil, fmt.Errorf("%w: %d not in [%d, %d]", ErrOffsetOutOfRange, offset, earliest, p.nextOffset)
 	}
 	out := []Record{}
 	if offset == p.nextOffset { // at LEO: empty, not an error
