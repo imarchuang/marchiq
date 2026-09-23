@@ -34,9 +34,14 @@ func OpenWithConfig(dataDir string, maxSegmentBytes, indexIntervalBytes int64) (
 	if err != nil {
 		return nil, err
 	}
+	groups, err := loadGroups(dataDir)
+	if err != nil {
+		return nil, err
+	}
 	b := &Broker{
 		dataDir:            dataDir,
 		topics:             make(map[string]*Topic, len(meta.Topics)),
+		groups:             groups,
 		maxSegmentBytes:    maxSegmentBytes,
 		indexIntervalBytes: indexIntervalBytes,
 	}
@@ -224,14 +229,18 @@ func (b *Broker) DescribeSegments(topic string, partition int) ([]SegmentInfo, e
 
 // Close marks the broker closed, then closes each partition. Partition locks
 // serialize this against in-flight appends; new operations see ErrClosed.
+// gmu is taken so group operations observe closed under the same lock they check.
 func (b *Broker) Close() error {
 	b.mu.Lock()
+	b.gmu.Lock()
 	if b.closed {
+		b.gmu.Unlock()
 		b.mu.Unlock()
 		return nil
 	}
 	b.closed = true
 	topics := b.topics
+	b.gmu.Unlock()
 	b.mu.Unlock()
 	var errs []error
 	for _, t := range topics {

@@ -18,6 +18,12 @@ var (
 	ErrPartitionNotFound = errors.New("partition not found")
 	ErrClosed            = errors.New("broker or partition is closed")
 	ErrOffsetOutOfRange  = errors.New("offset out of range")
+	// ErrGroupNotFound: the group (or its topic binding) does not exist; join first.
+	ErrGroupNotFound = errors.New("consumer group not found")
+	// ErrGroupConflict: group full or declared size mismatch (v0 has no rebalance).
+	ErrGroupConflict = errors.New("consumer group conflict")
+	// ErrMemberRequired: the group has several members; the caller must name one.
+	ErrMemberRequired = errors.New("member param required")
 	// ErrPartitionFenced rejects operations on a partition whose earlier
 	// write/sync failed; appending after a partial frame would corrupt offsets.
 	ErrPartitionFenced = errors.New("partition fenced after failure")
@@ -81,6 +87,9 @@ type BrokerAPI interface {
 	GetOffsets(topic string, partition int) (Offsets, error)
 	Fetch(topic string, partition int, offset Offset, maxRecords int, maxBytes int64) ([]Record, Offsets, error)
 	DescribeSegments(topic string, partition int) ([]SegmentInfo, error)
+	JoinGroup(group, topic, member string, size int) (Assignment, error)
+	CommitOffset(group, topic string, partition int, offset Offset) error
+	FetchGroup(group, topic, member string, maxRecords int, maxBytes int64) ([]PartitionFetch, error)
 	Close() error
 }
 
@@ -100,6 +109,9 @@ type Broker struct {
 	dataDir string
 	topics  map[string]*Topic
 	closed  bool
+
+	gmu    sync.RWMutex      // consumer groups: membership + committed offsets
+	groups map[string]*Group // persisted to meta/groups.json
 
 	maxSegmentBytes    int64 // roll threshold, from Open defaults
 	indexIntervalBytes int64 // sparse index density
