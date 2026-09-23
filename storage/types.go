@@ -1,13 +1,29 @@
-// Package storage implements the marchiq log format. Broker operations are
-// contracts only for now; see SKETCH.md for the Slice 1 implementation sequence.
+// Package storage implements the marchiq log format. Slice 1 implements
+// topic creation, partition append, and offset scans per SKETCH.md.
 package storage
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sync"
+)
+
+var (
+	ErrTopicExists       = errors.New("topic already exists")
+	ErrTopicNotFound     = errors.New("topic not found")
+	ErrPartitionNotFound = errors.New("partition not found")
+	ErrClosed            = errors.New("broker or partition is closed")
+	ErrOffsetOutOfRange  = errors.New("offset out of range")
+	// ErrPartitionFenced rejects operations on a partition whose earlier
+	// write/sync failed; appending after a partial frame would corrupt offsets.
+	ErrPartitionFenced = errors.New("partition fenced after failure")
+	// ErrResultUncertain means a write/sync failed after the record may have
+	// become durable; the partition is fenced and a retry may duplicate.
+	ErrResultUncertain = errors.New("operation result uncertain")
 )
 
 // Offset is local to a partition, not a topic or the whole broker.
@@ -55,9 +71,9 @@ type TopicsMetadata struct {
 	Topics  []TopicConfig `json:"topics"`
 }
 
-// BrokerAPI is a design contract, NOT an implemented storage backend yet.
-// Slice 1 requires explicit partitions and always syncs before acknowledging.
-// HTTP, routing, acks=0 and consumer groups do not belong in the codec.
+// BrokerAPI is the Slice 1 storage surface. It requires explicit partitions
+// and always syncs before acknowledging. HTTP, routing, acks=0 and consumer
+// groups do not belong in the storage layer.
 type BrokerAPI interface {
 	CreateTopic(TopicConfig) error
 	ListTopics() []TopicConfig
@@ -66,12 +82,13 @@ type BrokerAPI interface {
 	Close() error
 }
 
-// Proposed ownership graph. Methods arrive in Slice 1. One process owns a
-// dataDir; these mutexes do NOT protect against another broker process.
+// Ownership graph. One process owns a dataDir; these mutexes do NOT protect
+// against another broker process.
 type Broker struct {
 	mu      sync.RWMutex // topic catalog; partition locks serialize appends
 	dataDir string
 	topics  map[string]*Topic
+	closed  bool
 }
 
 type Topic struct {
@@ -85,11 +102,22 @@ type PartitionLog struct {
 	nextOffset Offset // reconstructed by scanning log; never an independent truth
 	active     *Segment
 	failed     error // write/sync failure fences further operations until reopen
+	closed     bool
+}
+
+// syncFile is the segment file surface. *os.File satisfies it; tests wrap it
+// to inject short writes and sync failures.
+type syncFile interface {
+	io.Writer
+	io.ReaderAt
+	Sync() error
+	Close() error
+	Stat() (os.FileInfo, error)
 }
 
 type Segment struct {
 	baseOffset Offset
-	file       *os.File // O_CREATE|O_RDWR|O_APPEND; reads use ReadAt/SectionReader
+	file       syncFile // O_CREATE|O_RDWR|O_APPEND; reads use ReadAt/SectionReader
 	sizeBytes  int64    // successfully published byte boundary
 	records    int64    // nextOffset = baseOffset + records for this single segment
 }

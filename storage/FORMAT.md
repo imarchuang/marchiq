@@ -1,6 +1,6 @@
 # Slice 0/1：磁盘格式 v1
 
-状态：record codec 已实现并测试；catalog 持久化和 partition append 仍是设计草图。
+状态：record codec、catalog 持久化、partition append 均已实现并测试（Slice 1 完成）。
 这是 marchiq 自己的格式，不兼容 Kafka wire/disk format。
 
 ## 1. 最小目录
@@ -40,7 +40,7 @@ data/
 Topic 名：`[a-zA-Z0-9][a-zA-Z0-9._-]{0,248}`；partition 数 1–1024，创建后不变。
 Slice 1 不接受 retention 配置，避免保存了却悄悄不执行。
 
-计划中的创建顺序（尚未实现）：
+创建顺序（已实现，`storage/topic.go` 的 `CreateTopic`）：
 
 1. 持 broker catalog 写锁，校验名称、数量、重复 topic；重复创建返回冲突。
 2. 创建目录和空 log；同步文件及新目录的父目录项。
