@@ -1,0 +1,10 @@
+services:
+  marchiq:
+    build: .
+    ports:
+      - "9092:9092"
+    volumes:
+      - marchiq-data:/data
+    stop_grace_period: 10s
+volumes:
+  marchiq-data:
