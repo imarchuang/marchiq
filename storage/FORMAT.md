@@ -1,6 +1,7 @@
-# Slice 0/1：磁盘格式 v1
+# Slice 0/1/2：磁盘格式 v1
 
-状态：record codec、catalog 持久化、partition append 均已实现并测试（Slice 1 完成）。
+状态：record codec、catalog 持久化、partition append、segment roll、稀疏索引、
+active 段短尾截断均已实现并测试（Slice 2 完成）。
 这是 marchiq 自己的格式，不兼容 Kafka wire/disk format。
 
 ## 1. 最小目录
@@ -18,9 +19,12 @@ data/
 ```
 
 - partition 是十进制整数；segment 文件名是 20 位十进制 base offset。
-- Slice 1 每个 partition 只有 base=0 的单段；暂不创建 index、timeindex、
-  active.segment、partition.meta、groups.json，避免同时维护多份真相。
-- log 是数据源；`nextOffset` 和文件长度从顺序扫描重建。
+- Slice 2 起每个 partition 由多个 segment 组成：active 段写满
+  `segmentBytes` 即 roll，新段 base = 当前 LEO；每段配一个同名 `.index`。
+  仍不创建 timeindex、active.segment、partition.meta、groups.json，
+  避免同时维护多份真相。
+- log 是数据源；`nextOffset`、文件长度、稀疏索引全部从顺序扫描重建，
+  `.index` 文件是扫描结果的派生缓存，Open 时原子重写。
 - 一个 dataDir 只允许一个进程使用。草图还没有跨进程锁，不支持共享目录。
 - dataDir 为可信本地目录；topic 名校验不是对恶意符号链接的安全沙箱。
 
@@ -107,20 +111,24 @@ latest / LEO         0       1       3
 commit 后续记录的是最后处理完成的 offset，下一次读 `commit + 1`。
 Slice 1 无 retention，因此 earliest 恒为 0。
 
-## 5. 顺序扫描与错误分类
+## 5. 顺序扫描、稀疏索引与错误分类
 
 从文件位置 0 开始，`DecodeRecord(reader, nextOffset)` 成功一次就递增 offset。
-读取 offset=O 需要从头扫描，O(N)；稀疏 index 到 Slice 2 再加入。
+Slice 2 起，读路径用稀疏 `.index` 定位到目标之前最近的索引项，再从该位置
+扫描，代价 O(indexInterval) 而非 O(N)；Open 时的恢复扫描仍是全量 O(N)。
 
-| 结果 | 含义 | Slice 1 计划 | Slice 2 计划 |
-|---|---|---|---|
-| `io.EOF` | frame 边界，0 bytes 消耗 | 正常结束 | 正常结束 |
-| `io.ErrUnexpectedEOF` | header/body 不完整 | 拒绝打开，不改文件 | active 尾部截断到 lastGood 并 Sync |
-| `ErrCorruptRecord` | 版本/长度结构不合法 | 拒绝打开 | 拒绝打开 |
-| `ErrRecordTooLarge` | 声明长度超过上限 | 拒绝打开 | 拒绝打开 |
-| 其他 I/O error | 设备/文件读取失败 | 报错 | 报错 |
+`.index` 为定长 16 字节行：`rel_offset(8) | position(8)`，big-endian int64。
+每写满 `indexIntervalBytes` 日志数据记一条，每段首条记录必记。
+
+| 结果 | 含义 | 当前行为（Slice 2 起） |
+|---|---|---|
+| `io.EOF` | frame 边界，0 bytes 消耗 | 正常结束 |
+| `io.ErrUnexpectedEOF` | header/body 不完整 | active 段：截断到 lastGood 并 Sync；sealed 段：拒绝打开 |
+| `ErrCorruptRecord` | 版本/长度结构不合法 | 拒绝打开 |
+| `ErrRecordTooLarge` | 声明长度超过上限 | 拒绝打开 |
+| 其他 I/O error | 设备/文件读取失败 | 报错 |
 
 scanner 必须单独保存 `lastGood`，不能用失败时已经消耗的字节位置作为截断点。
 不能跳过坏 record：implicit offset 会让后续所有 record 的身份发生偏移。
 即使是短尾也可能来自长度字段损坏；没有 CRC 时无法完全区分损坏和 torn write。
-sealed segment 将来出现短尾应报错，而不是按 active tail 自动修复。
+sealed segment 出现短尾报错，而不是按 active tail 自动修复（已实现）。

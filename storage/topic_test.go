@@ -191,6 +191,41 @@ func TestBrokerCloseFencesOperations(t *testing.T) {
 	}
 }
 
+// Slice 2: broker-level roll and reopen across segments.
+func TestBrokerRollAndReopen(t *testing.T) {
+	dir := t.TempDir()
+	b, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.maxSegmentBytes = 100
+	b.indexIntervalBytes = 30
+	if err := b.CreateTopic(TopicConfig{Name: "events", Partitions: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if _, err := b.Produce("events", 0, nil, []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	segs, err := b.DescribeSegments("events", 0)
+	if err != nil || len(segs) < 2 {
+		t.Fatalf("%+v %v", segs, err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b2 := openTestBroker(t, dir)
+	off, err := b2.GetOffsets("events", 0)
+	if err != nil || off.Latest != 10 {
+		t.Fatalf("%+v %v", off, err)
+	}
+	segs2, err := b2.DescribeSegments("events", 0)
+	if err != nil || len(segs2) != len(segs) {
+		t.Fatalf("%+v vs %+v %v", segs2, segs, err)
+	}
+}
+
 func TestListTopicsSorted(t *testing.T) {
 	b := openTestBroker(t, t.TempDir())
 	for _, name := range []string{"zeta", "alpha", "mid"} {

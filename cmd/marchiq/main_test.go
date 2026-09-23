@@ -117,4 +117,23 @@ func TestProduceAndOffsetsAPI(t *testing.T) {
 	if w.Code != 404 {
 		t.Fatalf("unknown topic offsets: %d", w.Code)
 	}
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/debug/segments?topic=events&partition=0", nil))
+	if w.Code != 200 {
+		t.Fatalf("debug segments: %d %s", w.Code, w.Body)
+	}
+	var dbg struct {
+		Segments []storage.SegmentInfo `json:"segments"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &dbg); err != nil {
+		t.Fatal(err)
+	}
+	if len(dbg.Segments) != 1 || dbg.Segments[0].BaseOffset != 0 || dbg.Segments[0].Records != 2 || dbg.Segments[0].SizeBytes == 0 {
+		t.Fatalf("%+v", dbg)
+	}
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/debug/segments?topic=ghost&partition=0", nil))
+	if w.Code != 404 {
+		t.Fatalf("unknown topic segments: %d", w.Code)
+	}
 }

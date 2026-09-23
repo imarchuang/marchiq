@@ -18,11 +18,12 @@ import (
 	"github.com/marchi/marchiq/storage"
 )
 
-const helpText = `marchiq — Slice 1: topic + partition log
+const helpText = `marchiq — Slice 2: segments + sparse index + torn-tail recovery
 POST /topics                      create topic, JSON body {"name":"events","partitions":2}
 GET  /topics                      list topics
 GET  /topics/{topic}/offsets      earliest/latest per partition
 POST /produce?topic=T&partition=P&key=K   append record; request body is the value
+GET  /debug/segments?topic=T&partition=P  list segment files + sizes
 GET  /healthz                     liveness
 `
 
@@ -40,6 +41,7 @@ func handler(api storage.BrokerAPI) http.Handler {
 	mux.HandleFunc("GET /topics", listTopics(api))
 	mux.HandleFunc("GET /topics/{topic}/offsets", topicOffsets(api))
 	mux.HandleFunc("POST /produce", produce(api))
+	mux.HandleFunc("GET /debug/segments", debugSegments(api))
 	return mux
 }
 
@@ -112,6 +114,32 @@ func topicOffsets(api storage.BrokerAPI) http.HandlerFunc {
 	}
 }
 
+func debugSegments(api storage.BrokerAPI) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		topic, partStr := q.Get("topic"), q.Get("partition")
+		if topic == "" || partStr == "" {
+			writeErr(w, http.StatusBadRequest, "topic and partition query params are required")
+			return
+		}
+		partition, err := strconv.Atoi(partStr)
+		if err != nil || partition < 0 {
+			writeErr(w, http.StatusBadRequest, "partition must be a non-negative integer")
+			return
+		}
+		segs, err := api.DescribeSegments(topic, partition)
+		if err != nil {
+			if errors.Is(err, storage.ErrTopicNotFound) || errors.Is(err, storage.ErrPartitionNotFound) {
+				writeErr(w, http.StatusNotFound, err.Error())
+			} else {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"topic": topic, "partition": partition, "segments": segs})
+	}
+}
+
 type produceResponse struct {
 	Topic       string `json:"topic"`
 	Partition   int    `json:"partition"`
@@ -158,8 +186,10 @@ func produce(api storage.BrokerAPI) http.HandlerFunc {
 func run() error {
 	dataDir := flag.String("dataDir", "./data", "broker data directory")
 	addr := flag.String("addr", ":9092", "HTTP listen address")
+	segmentBytes := flag.Int64("segmentBytes", storage.DefaultMaxSegmentBytes, "roll active segment beyond this size")
+	indexInterval := flag.Int64("indexIntervalBytes", storage.DefaultIndexIntervalBytes, "sparse index entry per this many bytes")
 	flag.Parse()
-	broker, err := storage.Open(*dataDir)
+	broker, err := storage.OpenWithConfig(*dataDir, *segmentBytes, *indexInterval)
 	if err != nil {
 		return err
 	}

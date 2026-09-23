@@ -11,7 +11,8 @@
 | Broker → Topic → PartitionLog → Segment | 已实现（Slice 1 单 segment） |
 | CreateTopic / Produce / GetOffsets / Close | 已实现，含 catalog 原子发布与重启扫描 |
 | topic HTTP（POST /topics、GET /topics、GET /topics/{t}/offsets、POST /produce） | 已实现 |
-| torn-tail 修复、index、roll、fetch HTTP、groups | 后续 slice |
+| segment roll、稀疏 .index、active 段 torn-tail 截断、GET /debug/segments | 已实现（Slice 2） |
+| fetch HTTP、consumer groups、retention | 后续 slice |
 
 不会用返回 nil 的占位方法伪装功能完成。`/fetch`、`/commit`、`/groups` 仍返回 404。
 
