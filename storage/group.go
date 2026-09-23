@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 )
 
@@ -227,7 +228,12 @@ func (b *Broker) FetchGroup(group, topic, member string, maxRecords int, maxByte
 			// auto.offset.reset=earliest semantics.
 			start = off.Earliest
 		}
-		if start > off.Latest { // defensive: committed never exceeds LEO-1
+		if start > off.Latest {
+			// acks=0 data loss can rewind LEO below committed+1 (an OS crash
+			// took records the group already committed — DURABILITY.md).
+			// Clamp to an empty poll at LEO: never error, never skip data,
+			// never rewrite the committed offset; new records arriving at the
+			// reused offsets are delivered from here.
 			start = off.Latest
 		}
 		recs := []Record{}
@@ -240,8 +246,96 @@ func (b *Broker) FetchGroup(group, topic, member string, maxRecords int, maxByte
 		if len(recs) > 0 {
 			next = recs[len(recs)-1].Offset + 1
 		}
+		b.countFetch(recs)
 		out = append(out, PartitionFetch{Partition: pi, Records: recs, NextOffset: next, HighWatermark: off.Latest})
 	}
+	return out, nil
+}
+
+// PartitionLag is one partition's group cursor against the log end. Committed
+// is null when the group never committed here. Lag = latest - next_fetch; it
+// goes NEGATIVE when data loss (e.g. acks=0 + OS crash) rewound LEO below the
+// committed offset — that is the observable signature, not an error to hide.
+type PartitionLag struct {
+	Partition int     `json:"partition"`
+	Committed *Offset `json:"committed"`
+	NextFetch Offset  `json:"next_fetch"`
+	Latest    Offset  `json:"latest"`
+	Lag       Offset  `json:"lag"`
+}
+
+// GroupLag is one (group, topic) binding's lag report, members included for
+// demo readability.
+type GroupLag struct {
+	Group      string         `json:"group"`
+	Topic      string         `json:"topic"`
+	Members    []string       `json:"members"`
+	Partitions []PartitionLag `json:"partitions"`
+}
+
+// GroupLag reports every joined (group, topic, partition) cursor against the
+// current LEO; group "" reports all groups. Lock order: gmu snapshot first,
+// released before mu/partition locks — mu → gmu is the only allowed nesting,
+// and this method avoids nesting entirely (same pattern as FetchGroup).
+func (b *Broker) GroupLag(group string) ([]GroupLag, error) {
+	type snap struct {
+		group, topic string
+		members      []string
+		offsets      map[int]Offset
+	}
+	b.gmu.RLock()
+	if b.closed {
+		b.gmu.RUnlock()
+		return nil, ErrClosed
+	}
+	var snaps []snap
+	for _, g := range b.groups {
+		if group != "" && g.Name != group {
+			continue
+		}
+		for topic, gt := range g.topics {
+			offsets := make(map[int]Offset, len(gt.Offsets))
+			for p, o := range gt.Offsets {
+				offsets[p] = o
+			}
+			snaps = append(snaps, snap{g.Name, topic, slices.Clone(gt.Members), offsets})
+		}
+	}
+	b.gmu.RUnlock()
+	if group != "" && len(snaps) == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, group)
+	}
+	out := make([]GroupLag, 0, len(snaps))
+	for _, s := range snaps {
+		t, err := b.getTopic(s.topic)
+		if err != nil {
+			return nil, err
+		}
+		gl := GroupLag{Group: s.group, Topic: s.topic, Members: s.members,
+			Partitions: make([]PartitionLag, 0, len(t.partitions))}
+		for pi := range t.partitions {
+			off, err := t.partitions[pi].Offsets()
+			if err != nil {
+				return nil, err
+			}
+			pl := PartitionLag{Partition: pi, Latest: off.Latest}
+			if c, ok := s.offsets[pi]; ok {
+				pl.Committed = &c
+				pl.NextFetch = c + 1
+			}
+			pl.Lag = pl.Latest - pl.NextFetch
+			gl.Partitions = append(gl.Partitions, pl)
+		}
+		out = append(out, gl)
+	}
+	// Map iteration order is random; sort for stable, reviewable output —
+	// the same reason catalogs persist in name order.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Group != out[j].Group {
+			return out[i].Group < out[j].Group
+		}
+		return out[i].Topic < out[j].Topic
+	})
 	return out, nil
 }
 

@@ -19,7 +19,7 @@ import (
 	"github.com/marchi/marchiq/storage"
 )
 
-const helpText = `marchiq — Slice 5: retention (per-topic retention_ms / retention_bytes, clamped by group commits)
+const helpText = `marchiq — Slice 6: polish (acks=0, broker-side partitioner, lag + stats, cmd/demo)
 POST /topics                      create topic, JSON body {"name":"events","partitions":2,
                                   "retention_ms":3600000,"retention_bytes":1073741824}
                                   retention fields optional, zero = unlimited; a background
@@ -28,7 +28,13 @@ POST /topics                      create topic, JSON body {"name":"events","part
                                   still needs (min committed+1) and never the active segment
 GET  /topics                      list topics
 GET  /topics/{topic}/offsets      earliest/latest per partition
-POST /produce?topic=T&partition=P&key=K   append record; request body is the value
+POST /produce?topic=T&partition=P&key=K&acks=A
+                                  append record; request body is the value.
+                                  partition=-1 lets the broker pick: key present →
+                                  fnv32a(key) % N (same key, same partition); no key →
+                                  per-topic round-robin. acks=1 (default) fsyncs before
+                                  ack; acks=0 returns after the page-cache write — an OS
+                                  crash can lose recent records (see storage/DURABILITY.md)
 GET  /fetch?topic=T&partition=P&offset=O&max_bytes=B&max_records=N
                                   read records from offset O; key/value are base64 in JSON
 GET  /fetch?group=G&topic=T&member=M      group mode: read from committed+1 on assigned partitions
@@ -36,6 +42,10 @@ POST /groups/{group}/join?topic=T&member=M&members=N
                                   join group (N = declared size, fixed by first join); returns static assignment
 POST /commit                      commit offset, JSON body {"group":"g","topic":"t","partition":0,"offset":9}
 GET  /debug/segments?topic=T&partition=P  list segment files + sizes
+GET  /debug/lag[?group=G]         per joined (group,topic,partition): committed, next_fetch,
+                                  latest, lag = latest - next_fetch (negative when data loss
+                                  rewound LEO below the committed offset)
+GET  /debug/stats                 process-lifetime produce/fetch record + payload-byte counters
 GET  /healthz                     liveness
 `
 
@@ -57,6 +67,8 @@ func handler(api storage.BrokerAPI) http.Handler {
 	mux.HandleFunc("POST /groups/{group}/join", joinGroup(api))
 	mux.HandleFunc("POST /commit", commitOffset(api))
 	mux.HandleFunc("GET /debug/segments", debugSegments(api))
+	mux.HandleFunc("GET /debug/lag", debugLag(api))
+	mux.HandleFunc("GET /debug/stats", debugStats(api))
 	return mux
 }
 
@@ -366,6 +378,32 @@ func debugSegments(api storage.BrokerAPI) http.HandlerFunc {
 	}
 }
 
+// debugLag serves GET /debug/lag[?group=G]: every joined (group, topic,
+// partition) cursor against the current LEO. An unknown group filter is a
+// 404, not an empty report — a typo'd group name must not look like "no lag".
+func debugLag(api storage.BrokerAPI) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		lags, err := api.GroupLag(r.URL.Query().Get("group"))
+		if err != nil {
+			if errors.Is(err, storage.ErrGroupNotFound) {
+				writeErr(w, http.StatusNotFound, err.Error())
+			} else {
+				writeErr(w, http.StatusInternalServerError, err.Error())
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"groups": lags})
+	}
+}
+
+// debugStats serves GET /debug/stats: process-lifetime counters (reset at
+// broker start, never persisted).
+func debugStats(api storage.BrokerAPI) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, api.Stats())
+	}
+}
+
 type produceResponse struct {
 	Topic       string `json:"topic"`
 	Partition   int    `json:"partition"`
@@ -382,16 +420,25 @@ func produce(api storage.BrokerAPI) http.HandlerFunc {
 			return
 		}
 		partition, err := strconv.Atoi(partStr)
-		if err != nil || partition < 0 {
-			writeErr(w, http.StatusBadRequest, "partition must be a non-negative integer (round-robin -1 is Slice 6)")
+		if err != nil || partition < -1 {
+			writeErr(w, http.StatusBadRequest, "partition must be -1 (broker picks: key hash, else round-robin) or a non-negative integer")
 			return
+		}
+		acks := storage.AcksLeader
+		if s := q.Get("acks"); s != "" {
+			a, err := storage.ParseAcks(s)
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			acks = a
 		}
 		value, err := io.ReadAll(http.MaxBytesReader(w, r.Body, storage.MaxRecordBytes+1))
 		if err != nil {
 			writeErr(w, http.StatusRequestEntityTooLarge, "value exceeds 1 MiB frame limit")
 			return
 		}
-		rec, err := api.Produce(topic, partition, []byte(q.Get("key")), value)
+		rec, chosen, err := api.Produce(topic, partition, []byte(q.Get("key")), value, acks)
 		if err != nil {
 			switch {
 			case errors.Is(err, storage.ErrTopicNotFound), errors.Is(err, storage.ErrPartitionNotFound):
@@ -404,7 +451,7 @@ func produce(api storage.BrokerAPI) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, produceResponse{
-			Topic: topic, Partition: partition, Offset: int64(rec.Offset), TimestampNS: rec.TimestampNS,
+			Topic: topic, Partition: chosen, Offset: int64(rec.Offset), TimestampNS: rec.TimestampNS,
 		})
 	}
 }

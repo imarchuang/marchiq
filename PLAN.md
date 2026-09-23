@@ -126,7 +126,7 @@ Binary protocol can be slice 6+; HTTP keeps demos and tests simple.
 | POST | `/topics` | create topic `{name, partitions, retention_ms?, retention_bytes?}` |
 | GET | `/topics` | list topics |
 | GET | `/topics/{topic}/offsets` | earliest / latest per partition |
-| POST | `/produce` | `topic`, `partition` (or `-1` for round-robin), `key`, `value` (body) |
+| POST | `/produce` | `topic`, `partition` (`-1` = key hash / round-robin), `key`, `acks` (`0`\|`1`), `value` (body) |
 | GET | `/fetch` | `group`, `topic`, `max_bytes`, `timeout_ms` |
 | POST | `/commit` | `{group, topic, partition, offset}` |
 | POST | `/groups/{group}/join` | register member; returns partition assignment (v0 static) |
@@ -236,12 +236,36 @@ committed+1; min across groups; uncommitted group blocks all; byte budget
 deletes oldest-first and keeps the active segment; restart preserves earliest
 and late-joining groups start at earliest; fetch below earliest rejected.
 
-### Slice 6 — polish (optional before “MVP done”)
+### Slice 6 — polish (done)
 
-- `acks=0` path
-- Produce partition `-1` round-robin
-- Basic metrics: bytes in/out, lag per group (`GET /debug/lag`)
-- `cmd/demo/` producer + consumer script
+- `acks=0` produce path: `POST /produce?...&acks=0` writes to the page cache
+  and returns without fsync; `acks=1` (default) keeps write→sync→publish;
+  unknown acks → 400. Storage takes an `Acks` parameter
+  (`AcksNone`/`AcksLeader`) on `Produce`/`Append`; the offset is still
+  assigned and published under the partition lock. Crash interaction: an OS
+  crash can rewind LEO **below** a group's committed offset — `FetchGroup`
+  clamps to an empty poll at the new LEO (no error, no skipped data, commit
+  untouched), and `lag` goes negative. Full story in `storage/DURABILITY.md`.
+- Produce `partition=-1`: the broker picks — key present → `fnv32a(key) % N`
+  (same key, same partition); no key → per-topic round-robin (atomic counter,
+  in-memory only). The thin-HTTP-client counterpart of Kafka's client-side
+  partitioner (docs/kafka-notes.md §2).
+- `GET /debug/lag[?group=G]`: per joined (group, topic, partition)
+  `{committed, next_fetch, latest, lag}` with `committed: null` when never
+  committed; group members included. `GET /debug/stats`: process-lifetime
+  produce/fetch record + payload-byte counters (reset at Open).
+- `cmd/demo/`: stdlib-only producer/consumer (`-mode produce|consume`);
+  producer prints the per-partition histogram and key→partition placement,
+  consumer joins/fetches/commits with a `-noCommit` replay mode.
+
+**Tests:** acks=0 skips sync (failSync fault injection) and stays fenced after
+an acks=1 failure; unknown acks rejected without fencing; same key → same
+partition, keyless spreads evenly, explicit partition wins, -1 on unknown
+topic → 404; lag after produce 10 / commit 6 is 3, uncommitted partition lag =
+LEO; LEO-rewind-below-committed clamps to an empty poll, never rewrites the
+commit, and resumes at the first offset past the cursor; stats counters move
+and reset at restart; HTTP coverage for acks/-1/400s, /debug/lag schema,
+/debug/stats.
 
 ---
 
@@ -269,7 +293,7 @@ is what production Kafka relies on for AZ failure.
 |---|---|
 | Log | produce/fetch/commit with topic, partition, offset |
 | HTTP headers | `X-Marchiq-Records-Returned`, `X-Marchiq-High-Watermark` |
-| Debug | `GET /debug/segments?topic=&partition=` lists segment files + sizes |
+| Debug | `GET /debug/segments?topic=&partition=` segment files + sizes; `GET /debug/lag` per-group lag; `GET /debug/stats` produce/fetch counters |
 
 No JMX. Metrics slice can add Prometheus later.
 
@@ -307,23 +331,33 @@ Module path: `github.com/marchi/marchiq` (mirror marchilogs).
 # terminal 1 — broker
 docker compose up
 
-# terminal 2 — create topic
+# terminal 2 — create topic, then produce 100 records over 10 keys with
+# partition=-1 (broker-side partitioner): histogram is balanced and every
+# key is pinned to exactly one partition
 curl -X POST localhost:9092/topics -d '{"name":"events","partitions":2}'
+go run ./cmd/demo -mode produce -topic events -n 100 -keys 10
 
-# terminal 3 — producer
-for i in $(seq 1 20); do
-  curl -X POST "localhost:9092/produce?topic=events&key=k$i" -d "payload-$i"
-done
+# terminal 3+4 — two-member consumer group (static assignment, one partition each)
+go run ./cmd/demo -mode consume -topic events -group workers -member w1 -members 2
+go run ./cmd/demo -mode consume -topic events -group workers -member w2 -members 2
 
-# terminal 4 — consumer group (two members, static assignment)
-curl -X POST "localhost:9092/groups/workers/join?topic=events&member=w1&members=2"
-curl -X POST "localhost:9092/groups/workers/join?topic=events&member=w2&members=2"
-curl "localhost:9092/fetch?group=workers&topic=events&member=w1&max_bytes=65536"
-curl -X POST localhost:9092/commit -d '{"group":"workers","topic":"events","partition":0,"offset":9}'
+# lag drains to zero; counters moved
+curl localhost:9092/debug/lag?group=workers
+curl localhost:9092/debug/stats
+
+# at-least-once replay: a -noCommit consumer restarted re-reads everything
+go run ./cmd/demo -mode consume -topic events -group workers -member w1 -members 2 -noCommit
+
+# acks=0 vs crash: produce with -acks 0, then simulate an OS crash (kill -9
+# alone keeps the kernel page cache — see storage/DURABILITY.md); LEO can
+# rewind below a committed offset, /debug/lag shows negative lag, and the
+# group keeps polling sanely at the new LEO
 ```
 
-Pass: two partitions show roughly balanced keys; after commit, restart broker,
-fetch does not replay committed offsets.
+Pass: two partitions show roughly balanced keys and same-key records share a
+partition; after commit, restarting the broker does not replay committed
+offsets; a `-noCommit` consumer restarted replays; `/debug/lag` reaches 0
+after a drain.
 
 ---
 
@@ -358,8 +392,8 @@ another LSM.
 - [x] Single broker, multiple topics, multiple partitions
 - [x] Produce → fetch → commit → restart → no duplicate past commit
 - [x] Segment roll + retention reclaim disk
-- [ ] `go test ./...` + Docker demo script documented
-- [ ] `DURABILITY.md` explains acks and why this is not LSM
+- [x] `go test ./...` + Docker demo script documented
+- [x] `DURABILITY.md` explains acks and why this is not LSM
 
 ---
 

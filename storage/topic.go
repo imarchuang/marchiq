@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -187,15 +188,54 @@ func (b *Broker) getPartition(topic string, partition int) (*PartitionLog, error
 	return t.partitions[partition], nil
 }
 
-// Produce appends one record to an explicit partition (round-robin partition
-// -1 is Slice 6). The partition lock, not the broker lock, serializes the
-// write+sync, so fsync of one partition never blocks producers on another.
-func (b *Broker) Produce(topic string, partition int, key, value []byte) (Record, error) {
-	p, err := b.getPartition(topic, partition)
+// Produce appends one record and returns it with the partition actually
+// written. partition -1 lets the broker pick — the thin-HTTP-client
+// counterpart of Kafka's client-side partitioner (docs/kafka-notes.md §2):
+// key present → fnv32a(key) % N, so one key always lands on one partition;
+// no key → per-topic round-robin. The partition lock, not the broker lock,
+// serializes the write+sync, so fsync of one partition never blocks
+// producers on another.
+func (b *Broker) Produce(topic string, partition int, key, value []byte, acks Acks) (Record, int, error) {
+	p, chosen, err := b.resolvePartition(topic, partition, key)
 	if err != nil {
-		return Record{}, err
+		return Record{}, -1, err
 	}
-	return p.Append(key, value)
+	r, err := p.Append(key, value, acks)
+	if err != nil {
+		return Record{}, -1, err
+	}
+	b.produceRecords.Add(1)
+	b.produceBytes.Add(int64(len(key) + len(value)))
+	return r, chosen, nil
+}
+
+// resolvePartition maps the requested partition to a log: the explicit one,
+// or — for -1 — the broker-side pick. The partition count is fixed at topic
+// creation, so the choice made here cannot go stale.
+func (b *Broker) resolvePartition(topic string, partition int, key []byte) (*PartitionLog, int, error) {
+	if partition >= 0 {
+		p, err := b.getPartition(topic, partition)
+		return p, partition, err
+	}
+	if partition != -1 {
+		return nil, -1, fmt.Errorf("%w: %s[%d]", ErrPartitionNotFound, topic, partition)
+	}
+	t, err := b.getTopic(topic)
+	if err != nil {
+		return nil, -1, err
+	}
+	n := len(t.partitions)
+	chosen := 0
+	if len(key) > 0 {
+		// fnv32a, not Kafka's murmur2: same shape (deterministic hash % N),
+		// deliberately not wire-compatible (PLAN open decisions).
+		h := fnv.New32a()
+		_, _ = h.Write(key) // hash.Hash never errors
+		chosen = int(h.Sum32() % uint32(n))
+	} else {
+		chosen = int(t.rr.Add(1)-1) % n
+	}
+	return t.partitions[chosen], chosen, nil
 }
 
 func (b *Broker) GetOffsets(topic string, partition int) (Offsets, error) {
@@ -222,7 +262,32 @@ func (b *Broker) Fetch(topic string, partition int, offset Offset, maxRecords in
 	if err != nil {
 		return nil, Offsets{}, err
 	}
+	b.countFetch(recs)
 	return recs, off, nil
+}
+
+// countFetch records delivered records in the stats counters. Payload bytes
+// only — the frame overhead is a storage detail, not something fetched.
+func (b *Broker) countFetch(recs []Record) {
+	if len(recs) == 0 {
+		return
+	}
+	var bytes int64
+	for _, r := range recs {
+		bytes += int64(len(r.Key) + len(r.Value))
+	}
+	b.fetchRecords.Add(int64(len(recs)))
+	b.fetchBytes.Add(bytes)
+}
+
+// Stats returns a snapshot of the process-lifetime counters.
+func (b *Broker) Stats() Stats {
+	return Stats{
+		ProduceRecords: b.produceRecords.Load(),
+		ProduceBytes:   b.produceBytes.Load(),
+		FetchRecords:   b.fetchRecords.Load(),
+		FetchBytes:     b.fetchBytes.Load(),
+	}
 }
 
 // DescribeSegments lists the segment layout of one partition for debugging.
