@@ -194,6 +194,25 @@ func (b *Broker) GetOffsets(topic string, partition int) (Offsets, error) {
 	return p.Offsets()
 }
 
+// Fetch reads records starting at an explicit offset (consumer groups and
+// committed offsets are Slice 4). It also returns the partition's current
+// offsets so callers can see the high-water mark alongside the records.
+func (b *Broker) Fetch(topic string, partition int, offset Offset, maxRecords int, maxBytes int64) ([]Record, Offsets, error) {
+	p, err := b.getPartition(topic, partition)
+	if err != nil {
+		return nil, Offsets{}, err
+	}
+	recs, err := p.ReadFrom(offset, maxRecords, maxBytes)
+	if err != nil {
+		return nil, Offsets{}, err
+	}
+	off, err := p.Offsets()
+	if err != nil {
+		return nil, Offsets{}, err
+	}
+	return recs, off, nil
+}
+
 // DescribeSegments lists the segment layout of one partition for debugging.
 func (b *Broker) DescribeSegments(topic string, partition int) ([]SegmentInfo, error) {
 	p, err := b.getPartition(topic, partition)

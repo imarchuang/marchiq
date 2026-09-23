@@ -79,6 +79,7 @@ type BrokerAPI interface {
 	ListTopics() []TopicConfig
 	Produce(topic string, partition int, key, value []byte) (Record, error)
 	GetOffsets(topic string, partition int) (Offsets, error)
+	Fetch(topic string, partition int, offset Offset, maxRecords int, maxBytes int64) ([]Record, Offsets, error)
 	DescribeSegments(topic string, partition int) ([]SegmentInfo, error)
 	Close() error
 }
