@@ -79,8 +79,18 @@ type BrokerAPI interface {
 	ListTopics() []TopicConfig
 	Produce(topic string, partition int, key, value []byte) (Record, error)
 	GetOffsets(topic string, partition int) (Offsets, error)
+	DescribeSegments(topic string, partition int) ([]SegmentInfo, error)
 	Close() error
 }
+
+const (
+	// DefaultMaxSegmentBytes rolls the active segment when the next frame
+	// would exceed this size. Tests use small values to exercise roll.
+	DefaultMaxSegmentBytes int64 = 16 << 20 // 16 MiB
+	// DefaultIndexIntervalBytes adds one sparse index entry per this many
+	// bytes of log data written (Kafka-style relative-offset index).
+	DefaultIndexIntervalBytes int64 = 4096 // 4 KiB
+)
 
 // Ownership graph. One process owns a dataDir; these mutexes do NOT protect
 // against another broker process.
@@ -89,6 +99,9 @@ type Broker struct {
 	dataDir string
 	topics  map[string]*Topic
 	closed  bool
+
+	maxSegmentBytes    int64 // roll threshold, from Open defaults
+	indexIntervalBytes int64 // sparse index density
 }
 
 type Topic struct {
@@ -97,32 +110,54 @@ type Topic struct {
 }
 
 type PartitionLog struct {
-	mu         sync.RWMutex // covers offset assignment, write, sync, publication
+	mu         sync.RWMutex // covers offset assignment, roll, write, sync, publication
 	dir        string
-	nextOffset Offset // reconstructed by scanning log; never an independent truth
-	active     *Segment
+	nextOffset Offset // reconstructed by scanning logs; never an independent truth
+	segments   []*Segment
 	failed     error // write/sync failure fences further operations until reopen
 	closed     bool
+
+	maxSegmentBytes    int64
+	indexIntervalBytes int64
 }
 
+// active returns the segment currently being appended to (always the last).
+func (p *PartitionLog) active() *Segment { return p.segments[len(p.segments)-1] }
+
 // syncFile is the segment file surface. *os.File satisfies it; tests wrap it
-// to inject short writes and sync failures.
+// to inject short writes and sync failures. Truncate is used only for active
+// segment torn-tail repair at open.
 type syncFile interface {
 	io.Writer
 	io.ReaderAt
 	Sync() error
 	Close() error
 	Stat() (os.FileInfo, error)
+	Truncate(size int64) error
 }
 
+// Segment is one immutable-once-sealed log file plus its sparse offset index.
+// Sealed segments are never written again; only the active segment appends.
 type Segment struct {
 	baseOffset Offset
 	file       syncFile // O_CREATE|O_RDWR|O_APPEND; reads use ReadAt/SectionReader
+	indexFile  syncFile // sparse index, rewritten atomically at open
 	sizeBytes  int64    // successfully published byte boundary
-	records    int64    // nextOffset = baseOffset + records for this single segment
+	records    int64    // nextOffset = last segment base + its records
+
+	index          []indexEntry // in-memory sparse index, rebuilt by scanning at open
+	lastIndexedPos int64        // file position of the last indexed record
+}
+
+// SegmentInfo is the read-only view of a segment for debugging/observability.
+type SegmentInfo struct {
+	BaseOffset Offset `json:"base_offset"`
+	SizeBytes  int64  `json:"size_bytes"`
+	Records    int64  `json:"records"`
 }
 
 func segmentName(base Offset) string { return fmt.Sprintf("%020d.log", base) }
+func indexName(base Offset) string   { return fmt.Sprintf("%020d.index", base) }
 
 // InitDirs is the only implemented broker-level operation in the sketch.
 // It creates no catalog or log files and never rewrites existing data.

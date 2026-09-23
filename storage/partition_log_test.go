@@ -1,29 +1,45 @@
 package storage
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 )
 
-// newTestPartition builds a partition whose segment file is optionally wrapped
-// for fault injection.
+const (
+	testMaxSegmentBytes    = 1 << 20 // effectively "never roll" unless overridden
+	testIndexIntervalBytes = 4096
+)
+
+// newTestPartition builds a partition whose log file is optionally wrapped
+// for fault injection (the index file stays real).
 func newTestPartition(t *testing.T, wrap func(syncFile) syncFile) *PartitionLog {
 	t.Helper()
 	dir := t.TempDir()
-	f, err := os.OpenFile(filepath.Join(dir, segmentName(0)), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	logF, err := os.OpenFile(filepath.Join(dir, segmentName(0)), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sf syncFile = f
+	idxF, err := os.OpenFile(filepath.Join(dir, indexName(0)), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sf syncFile = logF
 	if wrap != nil {
 		sf = wrap(sf)
 	}
-	p := &PartitionLog{dir: dir, active: &Segment{baseOffset: 0, file: sf}}
+	p := &PartitionLog{
+		dir:                dir,
+		maxSegmentBytes:    testMaxSegmentBytes,
+		indexIntervalBytes: testIndexIntervalBytes,
+		segments:           []*Segment{{baseOffset: 0, file: sf, indexFile: idxF}},
+	}
 	t.Cleanup(func() { p.Close() })
 	return p
 }
@@ -40,7 +56,16 @@ func createSegment(t *testing.T, dir string) {
 	}
 }
 
-// Acceptance 2+3: append 3 records, LEO=3, records readable by offset scan.
+func openTestPartition(t *testing.T, dir string) *PartitionLog {
+	t.Helper()
+	p, err := openPartition(dir, testMaxSegmentBytes, testIndexIntervalBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// Acceptance: append 3 records, LEO=3, records readable by offset.
 func TestAppendAndReadBack(t *testing.T) {
 	p := newTestPartition(t, nil)
 	for i, v := range []string{"one", "two", "three"} {
@@ -74,8 +99,8 @@ func TestAppendAndReadBack(t *testing.T) {
 	}
 }
 
-// Acceptance 4 (same partition): concurrent appends get unique offsets and
-// frames never interleave — every record decodes back at its own offset.
+// Concurrent appends get unique offsets and frames never interleave — every
+// record decodes back at its own offset.
 func TestAppendConcurrent(t *testing.T) {
 	p := newTestPartition(t, nil)
 	const n = 64
@@ -115,14 +140,11 @@ func TestAppendConcurrent(t *testing.T) {
 	}
 }
 
-// Acceptance 5: reopen continues the offset sequence instead of restarting at 0.
+// Reopen continues the offset sequence instead of restarting at 0.
 func TestReopenContinuesOffset(t *testing.T) {
 	dir := t.TempDir()
 	createSegment(t, dir)
-	p, err := openPartition(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	p := openTestPartition(t, dir)
 	for i := 0; i < 3; i++ {
 		if _, err := p.Append(nil, []byte{byte(i)}); err != nil {
 			t.Fatal(err)
@@ -131,10 +153,7 @@ func TestReopenContinuesOffset(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
-	p2, err := openPartition(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	p2 := openTestPartition(t, dir)
 	defer p2.Close()
 	if off, _ := p2.Offsets(); off != (Offsets{Earliest: 0, Latest: 3}) {
 		t.Fatalf("reopened %+v", off)
@@ -157,7 +176,7 @@ type shortWrite struct{ syncFile }
 
 func (f shortWrite) Write(b []byte) (int, error) { return len(b) - 1, nil }
 
-// Acceptance 6: write/sync failures never ack success and fence the partition.
+// Write/sync failures never ack success and fence the partition.
 func TestSyncFailureFencesPartition(t *testing.T) {
 	p := newTestPartition(t, func(f syncFile) syncFile { return failSync{f} })
 	if _, err := p.Append(nil, []byte("x")); !errors.Is(err, ErrResultUncertain) {
@@ -181,15 +200,12 @@ func TestShortWriteFencesPartition(t *testing.T) {
 	}
 }
 
-// Acceptance 7: a torn tail or corrupt frame refuses the open; Slice 1 never
-// modifies the file (truncation repair is Slice 2).
-func TestOpenPartitionTornTailRefuses(t *testing.T) {
+// Slice 2: a torn tail on the ACTIVE segment is truncated to the last good
+// boundary and synced; the partition keeps working and offsets continue.
+func TestOpenPartitionTruncatesTornTail(t *testing.T) {
 	dir := t.TempDir()
 	createSegment(t, dir)
-	p, err := openPartition(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	p := openTestPartition(t, dir)
 	for i := 0; i < 3; i++ {
 		if _, err := p.Append(nil, []byte{byte(i)}); err != nil {
 			t.Fatal(err)
@@ -203,31 +219,76 @@ func TestOpenPartitionTornTailRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	goodSize := info.Size()
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Write([]byte{recordMagic, 0, 0}); err != nil { // partial header
+	if _, err := f.Write([]byte{recordMagic, 0, 0}); err != nil { // partial header = torn write
 		t.Fatal(err)
 	}
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openPartition(dir); !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("err=%v", err)
+	p2 := openTestPartition(t, dir) // must succeed now, not refuse
+	defer p2.Close()
+	if off, _ := p2.Offsets(); off != (Offsets{Earliest: 0, Latest: 3}) {
+		t.Fatalf("after truncate %+v", off)
 	}
-	if info2, _ := os.Stat(path); info2.Size() != info.Size()+3 {
-		t.Fatalf("open modified file: %d -> %d", info.Size(), info2.Size())
+	if info2, _ := os.Stat(path); info2.Size() != goodSize {
+		t.Fatalf("truncated to %d, want %d", info2.Size(), goodSize)
+	}
+	r, err := p2.Append(nil, []byte("continues"))
+	if err != nil || r.Offset != 3 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	recs, err := p2.ReadFrom(0, 10)
+	if err != nil || len(recs) != 4 || string(recs[3].Value) != "continues" {
+		t.Fatalf("%+v %v", recs, err)
 	}
 }
 
-func TestOpenPartitionCorruptFrameRefuses(t *testing.T) {
+// A torn tail on a SEALED segment is corruption, not a crash artifact: the
+// open must refuse rather than repair immutable data.
+func TestOpenPartitionSealedTornTailRefuses(t *testing.T) {
 	dir := t.TempDir()
 	createSegment(t, dir)
-	p, err := openPartition(dir)
+	p, err := openPartition(dir, 60, testIndexIntervalBytes) // ~2 frames per segment
 	if err != nil {
 		t.Fatal(err)
 	}
+	for i := 0; i < 4; i++ { // forces at least one roll
+		if _, err := p.Append(nil, []byte(fmt.Sprintf("value-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(p.segments) < 2 {
+		t.Fatalf("expected roll, got %d segments", len(p.segments))
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sealed := filepath.Join(dir, segmentName(0))
+	f, err := os.OpenFile(sealed, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte{recordMagic, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openPartition(dir, 60, testIndexIntervalBytes); err == nil {
+		t.Fatal("opened a partition with a torn sealed segment")
+	}
+}
+
+// Corrupt frames still refuse the open, even on the active segment.
+func TestOpenPartitionCorruptFrameRefuses(t *testing.T) {
+	dir := t.TempDir()
+	createSegment(t, dir)
+	p := openTestPartition(t, dir)
 	if _, err := p.Append(nil, []byte("good")); err != nil {
 		t.Fatal(err)
 	}
@@ -245,13 +306,13 @@ func TestOpenPartitionCorruptFrameRefuses(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openPartition(dir); !errors.Is(err, ErrCorruptRecord) {
+	if _, err := openPartition(dir, testMaxSegmentBytes, testIndexIntervalBytes); !errors.Is(err, ErrCorruptRecord) {
 		t.Fatalf("err=%v", err)
 	}
 }
 
 func TestOpenPartitionMissingLog(t *testing.T) {
-	if _, err := openPartition(t.TempDir()); err == nil {
+	if _, err := openPartition(t.TempDir(), testMaxSegmentBytes, testIndexIntervalBytes); err == nil {
 		t.Fatal("opened a partition with no segment file")
 	}
 }
@@ -283,5 +344,198 @@ func TestCloseFencesOperations(t *testing.T) {
 	}
 	if err := p.Close(); err != nil { // idempotent
 		t.Fatal(err)
+	}
+}
+
+// --- Slice 2: roll, sparse index, cross-segment reads ---
+
+// Roll produces 000...000.log + 000...00N.log where N is the first offset of
+// the new segment; the sealed segment stays within the size limit.
+func TestSegmentRoll(t *testing.T) {
+	p := newTestPartition(t, nil)
+	p.maxSegmentBytes = 100 // ~23-byte frames => 4 per segment
+	var last Offset
+	for i := 0; i < 10; i++ {
+		r, err := p.Append(nil, []byte("v"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = r.Offset
+	}
+	if last != 9 {
+		t.Fatalf("last offset %d", last)
+	}
+	if len(p.segments) != 3 { // 4 + 4 + 2
+		t.Fatalf("segments=%d", len(p.segments))
+	}
+	if p.segments[0].sizeBytes > 100 {
+		t.Fatalf("sealed segment exceeds limit: %d", p.segments[0].sizeBytes)
+	}
+	if p.segments[1].baseOffset != 4 || p.segments[2].baseOffset != 8 {
+		t.Fatalf("bases: %d %d", p.segments[1].baseOffset, p.segments[2].baseOffset)
+	}
+	for _, name := range []string{segmentName(0), segmentName(4), segmentName(8), indexName(0), indexName(4), indexName(8)} {
+		if _, err := os.Stat(filepath.Join(p.dir, name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+	if off, _ := p.Offsets(); off != (Offsets{Earliest: 0, Latest: 10}) {
+		t.Fatalf("%+v", off)
+	}
+}
+
+// Reads span segment boundaries with contiguous offsets.
+func TestReadFromSpansSegments(t *testing.T) {
+	p := newTestPartition(t, nil)
+	p.maxSegmentBytes = 100
+	for i := 0; i < 10; i++ {
+		if _, err := p.Append(nil, []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recs, err := p.ReadFrom(0, 100)
+	if err != nil || len(recs) != 10 {
+		t.Fatalf("%d %v", len(recs), err)
+	}
+	for i, r := range recs {
+		if r.Offset != Offset(i) || string(r.Value) != fmt.Sprintf("v%d", i) {
+			t.Fatalf("record %d: %+v", i, r)
+		}
+	}
+	// Start mid-segment, cross into the next.
+	recs, err = p.ReadFrom(3, 4)
+	if err != nil || len(recs) != 4 || recs[0].Offset != 3 || recs[3].Offset != 6 {
+		t.Fatalf("%+v %v", recs, err)
+	}
+	// Start exactly at a segment base.
+	recs, err = p.ReadFrom(4, 2)
+	if err != nil || len(recs) != 2 || recs[0].Offset != 4 {
+		t.Fatalf("%+v %v", recs, err)
+	}
+}
+
+// The sparse index is persisted and every entry points at a record boundary.
+func TestIndexEntriesWritten(t *testing.T) {
+	p := newTestPartition(t, nil)
+	p.indexIntervalBytes = 30 // ~23-byte frames => index roughly every other record
+	for i := 0; i < 10; i++ {
+		if _, err := p.Append(nil, []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(p.dir, indexName(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) == 0 || len(data)%indexEntrySize != 0 {
+		t.Fatalf("index size %d", len(data))
+	}
+	f, err := os.Open(filepath.Join(p.dir, segmentName(0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var prevRel int64 = -1
+	for pos := 0; pos < len(data); pos += indexEntrySize {
+		rel := int64(binary.BigEndian.Uint64(data[pos : pos+8]))
+		filePos := int64(binary.BigEndian.Uint64(data[pos+8 : pos+16]))
+		if rel <= prevRel {
+			t.Fatalf("index not monotonic: %d after %d", rel, prevRel)
+		}
+		prevRel = rel
+		// Every entry must point at a decodable record with that exact offset.
+		r, _, err := DecodeRecord(io.NewSectionReader(f, filePos, math.MaxInt64), Offset(rel))
+		if err != nil || r.Offset != Offset(rel) {
+			t.Fatalf("entry (%d,%d): %+v %v", rel, filePos, r, err)
+		}
+	}
+	// First entry must be (0, 0).
+	if rel := int64(binary.BigEndian.Uint64(data[0:8])); rel != 0 {
+		t.Fatalf("first entry rel=%d", rel)
+	}
+}
+
+// Reopen with multiple segments: offsets continue, all records readable, and
+// the on-disk index is rebuilt consistently.
+func TestReopenMultiSegment(t *testing.T) {
+	dir := t.TempDir()
+	createSegment(t, dir)
+	p, err := openPartition(dir, 100, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if _, err := p.Append(nil, []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nSegs := len(p.segments)
+	if nSegs < 2 {
+		t.Fatalf("expected roll, got %d", nSegs)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	p2, err := openPartition(dir, 100, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p2.Close()
+	if len(p2.segments) != nSegs {
+		t.Fatalf("reopened with %d segments, want %d", len(p2.segments), nSegs)
+	}
+	if off, _ := p2.Offsets(); off.Latest != 10 {
+		t.Fatalf("%+v", off)
+	}
+	r, err := p2.Append(nil, []byte("next"))
+	if err != nil || r.Offset != 10 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	recs, err := p2.ReadFrom(0, 100)
+	if err != nil || len(recs) != 11 {
+		t.Fatalf("%d %v", len(recs), err)
+	}
+	for i, r := range recs {
+		if r.Offset != Offset(i) {
+			t.Fatalf("record %d at offset %d", i, r.Offset)
+		}
+	}
+}
+
+// Concurrent appends with a tiny segment limit: roll under contention must
+// still produce unique offsets and fully decodable segments.
+func TestConcurrentAppendWithRoll(t *testing.T) {
+	p := newTestPartition(t, nil)
+	p.maxSegmentBytes = 128
+	const n = 64
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, err := p.Append(nil, []byte(fmt.Sprintf("value-%d", i))); err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if off, _ := p.Offsets(); off.Latest != n {
+		t.Fatalf("LEO=%d", off.Latest)
+	}
+	recs, err := p.ReadFrom(0, n)
+	if err != nil || len(recs) != n {
+		t.Fatalf("%d %v", len(recs), err)
+	}
+	for i, r := range recs {
+		if r.Offset != Offset(i) {
+			t.Fatalf("record %d at offset %d", i, r.Offset)
+		}
+	}
+	// Segment bases must be contiguous: each base == previous base + records.
+	for i := 1; i < len(p.segments); i++ {
+		prev, cur := p.segments[i-1], p.segments[i]
+		if cur.baseOffset != prev.baseOffset+Offset(prev.records) {
+			t.Fatalf("gap between segments %d and %d", i-1, i)
+		}
 	}
 }

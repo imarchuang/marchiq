@@ -18,6 +18,15 @@ const catalogVersion = 1
 // Any corrupt catalog, missing log, or bad frame fails the whole open — a
 // broker that cannot account for registered data must not serve writes.
 func Open(dataDir string) (*Broker, error) {
+	return OpenWithConfig(dataDir, DefaultMaxSegmentBytes, DefaultIndexIntervalBytes)
+}
+
+// OpenWithConfig is Open with explicit roll/index density limits, so demos and
+// tests can exercise segment roll without writing gigabytes.
+func OpenWithConfig(dataDir string, maxSegmentBytes, indexIntervalBytes int64) (*Broker, error) {
+	if maxSegmentBytes <= 0 || indexIntervalBytes <= 0 {
+		return nil, fmt.Errorf("segment/index limits must be positive")
+	}
 	if err := InitDirs(dataDir); err != nil {
 		return nil, err
 	}
@@ -25,9 +34,14 @@ func Open(dataDir string) (*Broker, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &Broker{dataDir: dataDir, topics: make(map[string]*Topic, len(meta.Topics))}
+	b := &Broker{
+		dataDir:            dataDir,
+		topics:             make(map[string]*Topic, len(meta.Topics)),
+		maxSegmentBytes:    maxSegmentBytes,
+		indexIntervalBytes: indexIntervalBytes,
+	}
 	for _, cfg := range meta.Topics {
-		t, err := openTopic(dataDir, cfg)
+		t, err := b.openTopic(cfg)
 		if err != nil {
 			_ = b.Close()
 			return nil, fmt.Errorf("open topic %q: %w", cfg.Name, err)
@@ -37,10 +51,11 @@ func Open(dataDir string) (*Broker, error) {
 	return b, nil
 }
 
-func openTopic(dataDir string, cfg TopicConfig) (*Topic, error) {
+func (b *Broker) openTopic(cfg TopicConfig) (*Topic, error) {
 	t := &Topic{config: cfg, partitions: make([]*PartitionLog, 0, cfg.Partitions)}
 	for i := 0; i < cfg.Partitions; i++ {
-		p, err := openPartition(filepath.Join(dataDir, "topics", cfg.Name, strconv.Itoa(i)))
+		p, err := openPartition(filepath.Join(b.dataDir, "topics", cfg.Name, strconv.Itoa(i)),
+			b.maxSegmentBytes, b.indexIntervalBytes)
 		if err != nil {
 			for _, q := range t.partitions {
 				_ = q.Close()
@@ -73,7 +88,7 @@ func (b *Broker) CreateTopic(config TopicConfig) error {
 	if _, err := os.Stat(topicDir); !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("unregistered directory %s exists; manual cleanup required", topicDir)
 	}
-	files := make([]*os.File, 0, config.Partitions)
+	files := make([]*os.File, 0, 2*config.Partitions)
 	fail := func(err error) error { // close what we opened; keep dirs for inspection
 		for _, f := range files {
 			_ = f.Close()
@@ -85,15 +100,23 @@ func (b *Broker) CreateTopic(config TopicConfig) error {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fail(fmt.Errorf("create partition dir: %w", err))
 		}
-		f, err := os.OpenFile(filepath.Join(dir, segmentName(0)), os.O_CREATE|os.O_EXCL|os.O_RDWR|os.O_APPEND, 0o644)
+		logF, err := os.OpenFile(filepath.Join(dir, segmentName(0)), os.O_CREATE|os.O_EXCL|os.O_RDWR|os.O_APPEND, 0o644)
 		if err != nil {
 			return fail(fmt.Errorf("create segment: %w", err))
 		}
-		files = append(files, f)
-		if err := f.Sync(); err != nil {
+		files = append(files, logF)
+		idxF, err := os.OpenFile(filepath.Join(dir, indexName(0)), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o644)
+		if err != nil {
+			return fail(fmt.Errorf("create index: %w", err))
+		}
+		files = append(files, idxF)
+		if err := logF.Sync(); err != nil {
 			return fail(fmt.Errorf("sync segment: %w", err))
 		}
-		if err := syncDir(dir); err != nil { // the directory entry itself must be durable
+		if err := idxF.Sync(); err != nil {
+			return fail(fmt.Errorf("sync index: %w", err))
+		}
+		if err := syncDir(dir); err != nil { // the directory entries themselves must be durable
 			return fail(fmt.Errorf("sync partition dir: %w", err))
 		}
 	}
@@ -108,10 +131,13 @@ func (b *Broker) CreateTopic(config TopicConfig) error {
 		return fail(fmt.Errorf("publish catalog: %w", err))
 	}
 	t := &Topic{config: config, partitions: make([]*PartitionLog, 0, config.Partitions)}
-	for i, f := range files {
+	for i := 0; i < config.Partitions; i++ {
+		logF, idxF := files[2*i], files[2*i+1]
 		t.partitions = append(t.partitions, &PartitionLog{
-			dir:    filepath.Join(topicDir, strconv.Itoa(i)),
-			active: &Segment{baseOffset: 0, file: f},
+			dir:                filepath.Join(topicDir, strconv.Itoa(i)),
+			maxSegmentBytes:    b.maxSegmentBytes,
+			indexIntervalBytes: b.indexIntervalBytes,
+			segments:           []*Segment{{baseOffset: 0, file: logF, indexFile: idxF}},
 		})
 	}
 	b.topics[config.Name] = t
@@ -166,6 +192,15 @@ func (b *Broker) GetOffsets(topic string, partition int) (Offsets, error) {
 		return Offsets{}, err
 	}
 	return p.Offsets()
+}
+
+// DescribeSegments lists the segment layout of one partition for debugging.
+func (b *Broker) DescribeSegments(topic string, partition int) ([]SegmentInfo, error) {
+	p, err := b.getPartition(topic, partition)
+	if err != nil {
+		return nil, err
+	}
+	return p.DescribeSegments()
 }
 
 // Close marks the broker closed, then closes each partition. Partition locks
