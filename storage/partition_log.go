@@ -146,11 +146,12 @@ func scanSegment(f syncFile, base Offset, indexIntervalBytes int64) (sizeBytes, 
 }
 
 // Append assigns the next offset, rolls the segment if the frame would exceed
-// maxSegmentBytes, then makes the record durable BEFORE it becomes visible:
-// index entry → write → sync → only then publish. A short write or sync
-// failure fences the partition (p.failed): appending after a partial frame
-// would corrupt every subsequent record's identity.
-func (p *PartitionLog) Append(key, value []byte) (Record, error) {
+// maxSegmentBytes, then publishes the record: index entry → write → sync →
+// visible. AcksNone skips the syncs — the frame is in the page cache and
+// readable in-process, but an OS crash can lose it (DURABILITY.md). A short
+// write or sync failure fences the partition (p.failed): appending after a
+// partial frame would corrupt every subsequent record's identity.
+func (p *PartitionLog) Append(key, value []byte, acks Acks) (Record, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -158,6 +159,9 @@ func (p *PartitionLog) Append(key, value []byte) (Record, error) {
 	}
 	if p.failed != nil {
 		return Record{}, fmt.Errorf("%w: %v", ErrPartitionFenced, p.failed)
+	}
+	if acks != AcksNone && acks != AcksLeader { // fail closed on typos, not on data
+		return Record{}, fmt.Errorf("unknown acks %d", acks)
 	}
 	if p.nextOffset == math.MaxInt64 {
 		return Record{}, fmt.Errorf("offset overflow")
@@ -189,13 +193,15 @@ func (p *PartitionLog) Append(key, value []byte) (Record, error) {
 		p.failed = fmt.Errorf("write: n=%d of %d, err=%v", n, len(frame), err)
 		return Record{}, fmt.Errorf("%w: %v", ErrResultUncertain, p.failed)
 	}
-	if err := seg.file.Sync(); err != nil {
-		p.failed = fmt.Errorf("sync: %w", err)
-		return Record{}, fmt.Errorf("%w: %v", ErrResultUncertain, p.failed)
-	}
-	if err := seg.indexFile.Sync(); err != nil {
-		p.failed = fmt.Errorf("sync index: %w", err)
-		return Record{}, fmt.Errorf("%w: %v", ErrResultUncertain, p.failed)
+	if acks == AcksLeader {
+		if err := seg.file.Sync(); err != nil {
+			p.failed = fmt.Errorf("sync: %w", err)
+			return Record{}, fmt.Errorf("%w: %v", ErrResultUncertain, p.failed)
+		}
+		if err := seg.indexFile.Sync(); err != nil {
+			p.failed = fmt.Errorf("sync index: %w", err)
+			return Record{}, fmt.Errorf("%w: %v", ErrResultUncertain, p.failed)
+		}
 	}
 	seg.sizeBytes += int64(len(frame))
 	seg.records++

@@ -74,7 +74,7 @@ func readAll(p *PartitionLog, offset Offset, maxRecords int) ([]Record, error) {
 func TestAppendAndReadBack(t *testing.T) {
 	p := newTestPartition(t, nil)
 	for i, v := range []string{"one", "two", "three"} {
-		r, err := p.Append(nil, []byte(v))
+		r, err := p.Append(nil, []byte(v), AcksLeader)
 		if err != nil || r.Offset != Offset(i) {
 			t.Fatalf("append %d: %+v %v", i, r, err)
 		}
@@ -115,7 +115,7 @@ func TestAppendConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			r, err := p.Append(nil, []byte(fmt.Sprintf("v%d", i)))
+			r, err := p.Append(nil, []byte(fmt.Sprintf("v%d", i)), AcksLeader)
 			if err != nil {
 				t.Error(err)
 				return
@@ -151,7 +151,7 @@ func TestReopenContinuesOffset(t *testing.T) {
 	createSegment(t, dir)
 	p := openTestPartition(t, dir)
 	for i := 0; i < 3; i++ {
-		if _, err := p.Append(nil, []byte{byte(i)}); err != nil {
+		if _, err := p.Append(nil, []byte{byte(i)}, AcksLeader); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -163,7 +163,7 @@ func TestReopenContinuesOffset(t *testing.T) {
 	if off, _ := p2.Offsets(); off != (Offsets{Earliest: 0, Latest: 3}) {
 		t.Fatalf("reopened %+v", off)
 	}
-	r, err := p2.Append(nil, []byte("after-reopen"))
+	r, err := p2.Append(nil, []byte("after-reopen"), AcksLeader)
 	if err != nil || r.Offset != 3 {
 		t.Fatalf("%+v %v", r, err)
 	}
@@ -184,10 +184,10 @@ func (f shortWrite) Write(b []byte) (int, error) { return len(b) - 1, nil }
 // Write/sync failures never ack success and fence the partition.
 func TestSyncFailureFencesPartition(t *testing.T) {
 	p := newTestPartition(t, func(f syncFile) syncFile { return failSync{f} })
-	if _, err := p.Append(nil, []byte("x")); !errors.Is(err, ErrResultUncertain) {
+	if _, err := p.Append(nil, []byte("x"), AcksLeader); !errors.Is(err, ErrResultUncertain) {
 		t.Fatalf("err=%v", err)
 	}
-	if _, err := p.Append(nil, []byte("y")); !errors.Is(err, ErrPartitionFenced) {
+	if _, err := p.Append(nil, []byte("y"), AcksLeader); !errors.Is(err, ErrPartitionFenced) {
 		t.Fatalf("err=%v", err)
 	}
 	if off, err := p.Offsets(); err != nil || off.Latest != 0 { // nothing published
@@ -197,10 +197,10 @@ func TestSyncFailureFencesPartition(t *testing.T) {
 
 func TestShortWriteFencesPartition(t *testing.T) {
 	p := newTestPartition(t, func(f syncFile) syncFile { return shortWrite{f} })
-	if _, err := p.Append(nil, []byte("x")); !errors.Is(err, ErrResultUncertain) {
+	if _, err := p.Append(nil, []byte("x"), AcksLeader); !errors.Is(err, ErrResultUncertain) {
 		t.Fatalf("err=%v", err)
 	}
-	if _, err := p.Append(nil, []byte("y")); !errors.Is(err, ErrPartitionFenced) {
+	if _, err := p.Append(nil, []byte("y"), AcksLeader); !errors.Is(err, ErrPartitionFenced) {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -212,7 +212,7 @@ func TestOpenPartitionTruncatesTornTail(t *testing.T) {
 	createSegment(t, dir)
 	p := openTestPartition(t, dir)
 	for i := 0; i < 3; i++ {
-		if _, err := p.Append(nil, []byte{byte(i)}); err != nil {
+		if _, err := p.Append(nil, []byte{byte(i)}, AcksLeader); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -243,7 +243,7 @@ func TestOpenPartitionTruncatesTornTail(t *testing.T) {
 	if info2, _ := os.Stat(path); info2.Size() != goodSize {
 		t.Fatalf("truncated to %d, want %d", info2.Size(), goodSize)
 	}
-	r, err := p2.Append(nil, []byte("continues"))
+	r, err := p2.Append(nil, []byte("continues"), AcksLeader)
 	if err != nil || r.Offset != 3 {
 		t.Fatalf("%+v %v", r, err)
 	}
@@ -263,7 +263,7 @@ func TestOpenPartitionSealedTornTailRefuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 4; i++ { // forces at least one roll
-		if _, err := p.Append(nil, []byte(fmt.Sprintf("value-%d", i))); err != nil {
+		if _, err := p.Append(nil, []byte(fmt.Sprintf("value-%d", i)), AcksLeader); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -294,7 +294,7 @@ func TestOpenPartitionCorruptFrameRefuses(t *testing.T) {
 	dir := t.TempDir()
 	createSegment(t, dir)
 	p := openTestPartition(t, dir)
-	if _, err := p.Append(nil, []byte("good")); err != nil {
+	if _, err := p.Append(nil, []byte("good"), AcksLeader); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.Close(); err != nil {
@@ -325,10 +325,10 @@ func TestOpenPartitionMissingLog(t *testing.T) {
 // An oversized record is a caller error: it must NOT fence the partition.
 func TestAppendTooLargeDoesNotFence(t *testing.T) {
 	p := newTestPartition(t, nil)
-	if _, err := p.Append(nil, make([]byte, MaxRecordBytes)); !errors.Is(err, ErrRecordTooLarge) {
+	if _, err := p.Append(nil, make([]byte, MaxRecordBytes), AcksLeader); !errors.Is(err, ErrRecordTooLarge) {
 		t.Fatalf("err=%v", err)
 	}
-	if _, err := p.Append(nil, []byte("ok")); err != nil {
+	if _, err := p.Append(nil, []byte("ok"), AcksLeader); err != nil {
 		t.Fatalf("healthy partition fenced: %v", err)
 	}
 }
@@ -338,7 +338,7 @@ func TestCloseFencesOperations(t *testing.T) {
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Append(nil, nil); !errors.Is(err, ErrClosed) {
+	if _, err := p.Append(nil, nil, AcksLeader); !errors.Is(err, ErrClosed) {
 		t.Fatalf("err=%v", err)
 	}
 	if _, err := p.Offsets(); !errors.Is(err, ErrClosed) {
@@ -357,7 +357,7 @@ func TestCloseFencesOperations(t *testing.T) {
 func TestReadFromMaxBytes(t *testing.T) {
 	p := newTestPartition(t, nil)
 	for i := 0; i < 10; i++ {
-		if _, err := p.Append(nil, []byte("v")); err != nil { // 23-byte frames
+		if _, err := p.Append(nil, []byte("v"), AcksLeader); err != nil { // 23-byte frames
 			t.Fatal(err)
 		}
 	}
@@ -377,7 +377,7 @@ func TestReadFromMaxBytes(t *testing.T) {
 	q := newTestPartition(t, nil)
 	q.maxSegmentBytes = 60
 	for i := 0; i < 6; i++ {
-		if _, err := q.Append(nil, []byte("v")); err != nil {
+		if _, err := q.Append(nil, []byte("v"), AcksLeader); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -399,7 +399,7 @@ func TestSegmentRoll(t *testing.T) {
 	p.maxSegmentBytes = 100 // ~23-byte frames => 4 per segment
 	var last Offset
 	for i := 0; i < 10; i++ {
-		r, err := p.Append(nil, []byte("v"))
+		r, err := p.Append(nil, []byte("v"), AcksLeader)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -432,7 +432,7 @@ func TestReadFromSpansSegments(t *testing.T) {
 	p := newTestPartition(t, nil)
 	p.maxSegmentBytes = 100
 	for i := 0; i < 10; i++ {
-		if _, err := p.Append(nil, []byte(fmt.Sprintf("v%d", i))); err != nil {
+		if _, err := p.Append(nil, []byte(fmt.Sprintf("v%d", i)), AcksLeader); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -462,7 +462,7 @@ func TestIndexEntriesWritten(t *testing.T) {
 	p := newTestPartition(t, nil)
 	p.indexIntervalBytes = 30 // ~23-byte frames => index roughly every other record
 	for i := 0; i < 10; i++ {
-		if _, err := p.Append(nil, []byte("v")); err != nil {
+		if _, err := p.Append(nil, []byte("v"), AcksLeader); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -508,7 +508,7 @@ func TestReopenMultiSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 10; i++ {
-		if _, err := p.Append(nil, []byte(fmt.Sprintf("v%d", i))); err != nil {
+		if _, err := p.Append(nil, []byte(fmt.Sprintf("v%d", i)), AcksLeader); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -530,7 +530,7 @@ func TestReopenMultiSegment(t *testing.T) {
 	if off, _ := p2.Offsets(); off.Latest != 10 {
 		t.Fatalf("%+v", off)
 	}
-	r, err := p2.Append(nil, []byte("next"))
+	r, err := p2.Append(nil, []byte("next"), AcksLeader)
 	if err != nil || r.Offset != 10 {
 		t.Fatalf("%+v %v", r, err)
 	}
@@ -556,7 +556,7 @@ func TestConcurrentAppendWithRoll(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if _, err := p.Append(nil, []byte(fmt.Sprintf("value-%d", i))); err != nil {
+			if _, err := p.Append(nil, []byte(fmt.Sprintf("value-%d", i)), AcksLeader); err != nil {
 				t.Error(err)
 			}
 		}(i)
@@ -580,5 +580,43 @@ func TestConcurrentAppendWithRoll(t *testing.T) {
 		if cur.baseOffset != prev.baseOffset+Offset(prev.records) {
 			t.Fatalf("gap between segments %d and %d", i-1, i)
 		}
+	}
+}
+
+// --- Slice 6: acks ---
+
+// acks=0 never calls Sync: on a file whose Sync always fails, the acks=0
+// append still succeeds and is readable in-process, while acks=1 on the same
+// file fails and fences the partition — and the fence then covers acks=0 too.
+func TestAppendAcksNoneSkipsSync(t *testing.T) {
+	p := newTestPartition(t, func(f syncFile) syncFile { return failSync{f} })
+	r, err := p.Append(nil, []byte("x"), AcksNone)
+	if err != nil || r.Offset != 0 {
+		t.Fatalf("%+v %v", r, err)
+	}
+	recs, err := readAll(p, 0, 10)
+	if err != nil || len(recs) != 1 || string(recs[0].Value) != "x" {
+		t.Fatalf("%+v %v", recs, err)
+	}
+	if _, err := p.Append(nil, []byte("y"), AcksLeader); !errors.Is(err, ErrResultUncertain) {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := p.Append(nil, []byte("z"), AcksNone); !errors.Is(err, ErrPartitionFenced) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+// An unknown acks value is a caller error: rejected before any write, and it
+// does NOT fence the partition.
+func TestAppendUnknownAcksRejected(t *testing.T) {
+	p := newTestPartition(t, nil)
+	if _, err := p.Append(nil, []byte("x"), Acks(7)); err == nil {
+		t.Fatal("accepted acks=7")
+	}
+	if off, _ := p.Offsets(); off.Latest != 0 {
+		t.Fatalf("rejected append moved LEO: %+v", off)
+	}
+	if _, err := p.Append(nil, []byte("ok"), AcksLeader); err != nil {
+		t.Fatalf("healthy partition fenced: %v", err)
 	}
 }

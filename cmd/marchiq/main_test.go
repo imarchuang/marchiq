@@ -243,3 +243,138 @@ func TestFetchAPI(t *testing.T) {
 		t.Fatalf("max_bytes=100 returned %d records", len(resp.Records))
 	}
 }
+
+// Slice 6: the acks param and the broker-side partitioner on the wire.
+func TestProduceAcksAndPartitionerAPI(t *testing.T) {
+	h := testHandler(t)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/topics", strings.NewReader(`{"name":"events","partitions":2}`)))
+	if w.Code != 201 {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	produce := func(path string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader("payload")))
+		return w
+	}
+	// partition=-1 with a key: 200, and the response names the chosen partition.
+	w = produce("/produce?topic=events&partition=-1&key=k1&acks=0")
+	if w.Code != 200 {
+		t.Fatalf("acks=0 partition=-1: %d %s", w.Code, w.Body)
+	}
+	var first produceResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	if first.Partition < 0 || first.Partition > 1 || first.Offset != 0 {
+		t.Fatalf("%+v", first)
+	}
+	// Same key lands on the same partition; default acks (omitted) is fine.
+	w = produce("/produce?topic=events&partition=-1&key=k1")
+	if w.Code != 200 {
+		t.Fatalf("second produce: %d %s", w.Code, w.Body)
+	}
+	var second produceResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.Partition != first.Partition {
+		t.Fatalf("same key moved: %+v then %+v", first, second)
+	}
+	for path, want := range map[string]int{
+		"/produce?topic=events&partition=-1&acks=2":   400, // unknown acks
+		"/produce?topic=events&partition=-1&acks=all": 400,
+		"/produce?topic=events&partition=-2":          400, // below -1
+		"/produce?topic=ghost&partition=-1":           404, // -1 on unknown topic
+	} {
+		if w := produce(path); w.Code != want {
+			t.Fatalf("%s: %d, want %d (%s)", path, w.Code, want, w.Body)
+		}
+	}
+}
+
+// Slice 6: /debug/lag reports committed/next_fetch/latest/lag per joined
+// (group, topic, partition); /debug/stats counters move with traffic.
+func TestDebugLagAndStatsAPI(t *testing.T) {
+	h := testHandler(t)
+	post := func(path, body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(body)))
+		return w
+	}
+	get := func(path string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		return w
+	}
+	if w := post("/topics", `{"name":"events","partitions":2}`); w.Code != 201 {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	if w := post("/groups/workers/join?topic=events&member=w1&members=1", ""); w.Code != 200 {
+		t.Fatalf("join: %d %s", w.Code, w.Body)
+	}
+	for i := 0; i < 10; i++ {
+		if w := post("/produce?topic=events&partition=0", "v"); w.Code != 200 {
+			t.Fatalf("produce p0: %d", w.Code)
+		}
+	}
+	for i := 0; i < 4; i++ {
+		if w := post("/produce?topic=events&partition=1", "v"); w.Code != 200 {
+			t.Fatalf("produce p1: %d", w.Code)
+		}
+	}
+	if w := post("/commit", `{"group":"workers","topic":"events","partition":0,"offset":6}`); w.Code != 200 {
+		t.Fatalf("commit: %d %s", w.Code, w.Body)
+	}
+	w := get("/debug/lag")
+	if w.Code != 200 {
+		t.Fatalf("lag: %d %s", w.Code, w.Body)
+	}
+	var lag struct {
+		Groups []struct {
+			Group      string   `json:"group"`
+			Members    []string `json:"members"`
+			Partitions []struct {
+				Partition int    `json:"partition"`
+				Committed *int64 `json:"committed"`
+				NextFetch int64  `json:"next_fetch"`
+				Latest    int64  `json:"latest"`
+				Lag       int64  `json:"lag"`
+			} `json:"partitions"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &lag); err != nil {
+		t.Fatal(err)
+	}
+	if len(lag.Groups) != 1 || lag.Groups[0].Group != "workers" ||
+		len(lag.Groups[0].Members) != 1 || lag.Groups[0].Members[0] != "w1" ||
+		len(lag.Groups[0].Partitions) != 2 {
+		t.Fatalf("%s", w.Body)
+	}
+	p0, p1 := lag.Groups[0].Partitions[0], lag.Groups[0].Partitions[1]
+	if p0.Committed == nil || *p0.Committed != 6 || p0.NextFetch != 7 || p0.Latest != 10 || p0.Lag != 3 {
+		t.Fatalf("p0: %+v", p0)
+	}
+	if p1.Committed != nil || p1.NextFetch != 0 || p1.Latest != 4 || p1.Lag != 4 {
+		t.Fatalf("p1: %+v", p1)
+	}
+	if w := get("/debug/lag?group=ghost"); w.Code != 404 {
+		t.Fatalf("unknown group lag: %d", w.Code)
+	}
+	// Stats: 14 records of 1 payload byte in, nothing out yet.
+	w = get("/debug/stats")
+	var stats map[string]int64
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &stats) != nil {
+		t.Fatalf("stats: %d %s", w.Code, w.Body)
+	}
+	if stats["produce_records"] != 14 || stats["produce_bytes"] != 14 || stats["fetch_records"] != 0 {
+		t.Fatalf("%v", stats)
+	}
+	if w := get("/fetch?topic=events&partition=0&offset=0&max_records=3"); w.Code != 200 {
+		t.Fatalf("fetch: %d", w.Code)
+	}
+	w = get("/debug/stats")
+	if json.Unmarshal(w.Body.Bytes(), &stats) != nil || stats["fetch_records"] != 3 || stats["fetch_bytes"] != 3 {
+		t.Fatalf("%v", stats)
+	}
+}

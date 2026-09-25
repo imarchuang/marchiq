@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -84,19 +85,57 @@ type TopicsMetadata struct {
 	Topics  []TopicConfig `json:"topics"`
 }
 
-// BrokerAPI is the Slice 1 storage surface. It requires explicit partitions
-// and always syncs before acknowledging. HTTP, routing, acks=0 and consumer
-// groups do not belong in the storage layer.
+// Acks selects how much durability work a produce waits for before
+// returning. The values match the HTTP wire form (acks=0|1).
+type Acks int
+
+const (
+	// AcksNone returns as soon as the frame reaches the page cache: no
+	// fsync. An OS crash can lose recent records and rewind LEO — the
+	// interaction with committed offsets is documented in DURABILITY.md.
+	AcksNone Acks = 0
+	// AcksLeader (the default) fsyncs segment and index before returning.
+	AcksLeader Acks = 1
+)
+
+// ParseAcks validates the wire form of the acks parameter: "0" or "1".
+func ParseAcks(s string) (Acks, error) {
+	switch s {
+	case "0":
+		return AcksNone, nil
+	case "1":
+		return AcksLeader, nil
+	default:
+		return AcksLeader, fmt.Errorf("unknown acks %q (want 0 or 1)", s)
+	}
+}
+
+// Stats is the broker's process-lifetime produce/fetch counters. They are
+// never persisted and reset at Open: they answer "what has THIS process
+// moved since it started", not anything about the data on disk. Bytes are
+// payload bytes (len(key)+len(value)), not on-disk frame bytes.
+type Stats struct {
+	ProduceRecords int64 `json:"produce_records"`
+	ProduceBytes   int64 `json:"produce_bytes"`
+	FetchRecords   int64 `json:"fetch_records"`
+	FetchBytes     int64 `json:"fetch_bytes"`
+}
+
+// BrokerAPI is the storage surface exposed to the HTTP layer. Produce
+// accepts partition -1 (broker-side partitioner) and an acks policy; group
+// and debug reads live here too so the HTTP package stays a thin adapter.
 type BrokerAPI interface {
 	CreateTopic(TopicConfig) error
 	ListTopics() []TopicConfig
-	Produce(topic string, partition int, key, value []byte) (Record, error)
+	Produce(topic string, partition int, key, value []byte, acks Acks) (Record, int, error)
 	GetOffsets(topic string, partition int) (Offsets, error)
 	Fetch(topic string, partition int, offset Offset, maxRecords int, maxBytes int64) ([]Record, Offsets, error)
 	DescribeSegments(topic string, partition int) ([]SegmentInfo, error)
 	JoinGroup(group, topic, member string, size int) (Assignment, error)
 	CommitOffset(group, topic string, partition int, offset Offset) error
 	FetchGroup(group, topic, member string, maxRecords int, maxBytes int64) ([]PartitionFetch, error)
+	GroupLag(group string) ([]GroupLag, error)
+	Stats() Stats
 	Close() error
 }
 
@@ -133,11 +172,21 @@ type Broker struct {
 	retentionKick     chan struct{}
 	retentionStop     chan struct{}
 	retentionWg       sync.WaitGroup
+
+	// Slice 6 stats counters. Atomics, never persisted, reset at Open.
+	produceRecords atomic.Int64
+	produceBytes   atomic.Int64
+	fetchRecords   atomic.Int64
+	fetchBytes     atomic.Int64
 }
 
 type Topic struct {
 	config     TopicConfig
 	partitions []*PartitionLog
+	// rr is the round-robin cursor for keyless produce with partition -1.
+	// In-memory only: a restart re-deals from partition 0, which is fine —
+	// round-robin promises spread, not continuity.
+	rr atomic.Uint64
 }
 
 type PartitionLog struct {
