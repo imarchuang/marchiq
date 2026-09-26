@@ -4,13 +4,14 @@
 // so every wire round-trip stays visible.
 //
 //	go run ./cmd/demo -mode produce -topic events -n 100 -keys 10
-//	go run ./cmd/demo -mode consume -topic events -group workers -member w1 -members 2
+//	go run ./cmd/demo -mode consume -topic events -group workers -member w1
 package main
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -32,7 +34,7 @@ func main() {
 	acks := flag.Int("acks", 1, "produce: 1 waits for fsync, 0 returns after the page-cache write")
 	group := flag.String("group", "workers", "consume: consumer group")
 	member := flag.String("member", "", "consume: member id (default: demo-<pid>)")
-	members := flag.Int("members", 1, "consume: declared group size (fixed by the first join)")
+	sessionTimeout := flag.Duration("sessionTimeout", 10*time.Second, "consume: session timeout to pace heartbeats against (interval = timeout/3); should match the broker's -sessionTimeout")
 	noCommit := flag.Bool("noCommit", false, "consume: fetch and print but never commit (restarting replays everything)")
 	flag.Parse()
 
@@ -44,7 +46,7 @@ func main() {
 	case "produce":
 		err = runProduce(*addr, *topic, *n, *keys, *acks)
 	case "consume":
-		err = runConsume(*addr, *topic, *group, *member, *members, *noCommit)
+		err = runConsume(*addr, *topic, *group, *member, *sessionTimeout, *noCommit)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown -mode %q (want produce|consume)\n", *mode)
 		flag.Usage()
@@ -56,8 +58,18 @@ func main() {
 	}
 }
 
-// req issues one HTTP call and returns the status and body. Non-2xx is an
-// error carrying the broker's message — the demo fails loudly, never guesses.
+// httpError is a non-2xx response. The status matters to the consumer loop
+// (409 = fenced by a newer generation, 404 = evicted), so it survives as a
+// typed error instead of a flat string.
+type httpError struct {
+	status int
+	msg    string
+}
+
+func (e *httpError) Error() string { return e.msg }
+
+// req issues one HTTP call and returns the body. Non-2xx is an *httpError
+// carrying the broker's message — the demo fails loudly, never guesses.
 func req(client *http.Client, method, url string, body io.Reader) ([]byte, error) {
 	r, err := http.NewRequest(method, url, body)
 	if err != nil {
@@ -73,7 +85,8 @@ func req(client *http.Client, method, url string, body io.Reader) ([]byte, error
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, fmt.Errorf("%s %s: %s: %s", method, url, resp.Status, bytes.TrimSpace(data))
+		return nil, &httpError{status: resp.StatusCode,
+			msg: fmt.Sprintf("%s %s: %s: %s", method, url, resp.Status, bytes.TrimSpace(data))}
 	}
 	return data, nil
 }
@@ -138,40 +151,133 @@ func runProduce(addr, topic string, n, keys, acks int) error {
 	return nil
 }
 
-// runConsume joins the group, then loops fetch → print → commit-last-offset
-// per partition until Ctrl-C. With -noCommit it never commits, so a restart
-// replays from the last committed offset (at-least-once, made visible).
-func runConsume(addr, topic, group, member string, members int, noCommit bool) error {
+// runConsume is a Kafka-client-shaped loop: join, then a heartbeat goroutine
+// (interval = sessionTimeout/3) keeps the session alive while the main loop
+// fetch → print → commit-last-offset with the current generation. A 409 from
+// heartbeat or commit means the group rebalanced without us (fenced); a 404
+// from fetch means we were evicted — both end in rejoin and resume, exactly
+// like a Kafka client reacting to REBALANCE_IN_PROGRESS. On shutdown it sends
+// LeaveGroup, so the group rebalances immediately instead of waiting out the
+// session timeout. With -noCommit it never commits, so a restart replays
+// from the last committed offset (at-least-once, made visible).
+func runConsume(addr, topic, group, member string, sessionTimeout time.Duration, noCommit bool) error {
 	client := &http.Client{Timeout: 10 * time.Second}
-	join := fmt.Sprintf("%s/groups/%s/join?topic=%s&member=%s&members=%d",
-		addr, url.PathEscape(group), url.QueryEscape(topic), url.QueryEscape(member), members)
-	data, err := req(client, "POST", join, nil)
-	if err != nil {
-		return fmt.Errorf("join: %w", err)
-	}
-	var asg struct {
-		Partitions []int `json:"partitions"`
-	}
-	if err := json.Unmarshal(data, &asg); err != nil {
-		return fmt.Errorf("join: bad response: %w", err)
-	}
-	fmt.Printf("joined group=%s member=%s topic=%s partitions=%v (commit=%v)\n",
-		group, member, topic, asg.Partitions, !noCommit)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Shared with the heartbeat goroutine: the generation every commit must
+	// carry, and whether we were fenced and owe the broker a rejoin.
+	var mu sync.Mutex
+	generation := 0
+	fenced := false
+	joinURL := fmt.Sprintf("%s/groups/%s/join?topic=%s&member=%s",
+		addr, url.PathEscape(group), url.QueryEscape(topic), url.QueryEscape(member))
+	join := func() error {
+		data, err := req(client, "POST", joinURL, nil)
+		if err != nil {
+			return fmt.Errorf("join: %w", err)
+		}
+		var asg struct {
+			Generation int   `json:"generation"`
+			Partitions []int `json:"partitions"`
+		}
+		if err := json.Unmarshal(data, &asg); err != nil {
+			return fmt.Errorf("join: bad response: %w", err)
+		}
+		mu.Lock()
+		generation, fenced = asg.Generation, false
+		mu.Unlock()
+		fmt.Printf("joined group=%s member=%s topic=%s generation=%d partitions=%v (commit=%v)\n",
+			group, member, topic, asg.Generation, asg.Partitions, !noCommit)
+		return nil
+	}
+	if err := join(); err != nil {
+		return err
+	}
+
+	hbBase := fmt.Sprintf("%s/groups/%s/heartbeat?topic=%s&member=%s",
+		addr, url.PathEscape(group), url.QueryEscape(topic), url.QueryEscape(member))
+	go func() {
+		interval := sessionTimeout / 3
+		if interval <= 0 {
+			interval = time.Second
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			mu.Lock()
+			gen, wasFenced := generation, fenced
+			mu.Unlock()
+			if wasFenced {
+				continue // the main loop is rejoining; don't heartbeat a stale session
+			}
+			_, err := req(client, "POST", fmt.Sprintf("%s&generation=%d", hbBase, gen), nil)
+			var he *httpError
+			if errors.As(err, &he) && he.status == http.StatusConflict {
+				// The generation moved without us: flag fenced and let the
+				// main loop rejoin (pull, not push). A 200 needs no parsing —
+				// it can only confirm the generation we already hold.
+				mu.Lock()
+				fenced = true
+				mu.Unlock()
+			}
+			// 404 (evicted) and network errors surface on the next fetch or
+			// commit, which drives the rejoin from the main loop.
+		}
+	}()
+
+	// A polite Kafka client sends LeaveGroup on close. Committed offsets
+	// survive — leaving never touches them.
+	leave := func() {
+		u := fmt.Sprintf("%s/groups/%s/leave?topic=%s&member=%s",
+			addr, url.PathEscape(group), url.QueryEscape(topic), url.QueryEscape(member))
+		if _, err := req(client, "POST", u, nil); err != nil {
+			fmt.Fprintln(os.Stderr, "leave:", err)
+		}
+	}
+
 	fetchURL := fmt.Sprintf("%s/fetch?group=%s&topic=%s&member=%s",
 		addr, url.QueryEscape(group), url.QueryEscape(topic), url.QueryEscape(member))
 	var total int64
 	for {
 		if err := ctx.Err(); err != nil {
+			leave()
 			fmt.Printf("\nstopped; consumed %d records\n", total)
 			return nil
 		}
+		mu.Lock()
+		if fenced {
+			mu.Unlock()
+			if err := join(); err != nil {
+				fmt.Fprintln(os.Stderr, "rejoin:", err)
+				if !sleep(ctx, time.Second) {
+					leave()
+					return nil
+				}
+			}
+			continue
+		}
+		gen := generation
+		mu.Unlock()
+
 		data, err := req(client, "GET", fetchURL, nil)
 		if err != nil {
+			var he *httpError
+			if errors.As(err, &he) && he.status == http.StatusNotFound {
+				// Evicted zombies get member-not-found here: rejoin.
+				mu.Lock()
+				fenced = true
+				mu.Unlock()
+				continue
+			}
 			fmt.Fprintln(os.Stderr, "fetch:", err)
 			if !sleep(ctx, time.Second) {
+				leave()
 				return nil
 			}
 			continue
@@ -197,20 +303,33 @@ func runConsume(addr, topic, group, member string, members int, noCommit bool) e
 				got++
 				total++
 			}
-			// Commit the last PROCESSED offset (next_offset-1); the next
-			// fetch resumes after it. Commit after printing = at-least-once.
+			// Commit the last PROCESSED offset (next_offset-1) with the
+			// generation we hold; the next fetch resumes after it. Commit
+			// after printing = at-least-once.
 			if !noCommit && len(p.Records) > 0 {
 				commit := map[string]any{
 					"group": group, "topic": topic,
 					"partition": p.Partition, "offset": p.NextOffset - 1,
+					"generation": gen,
 				}
 				body, _ := json.Marshal(commit)
 				if _, err := req(client, "POST", addr+"/commit", bytes.NewReader(body)); err != nil {
+					var he *httpError
+					if errors.As(err, &he) && he.status == http.StatusConflict {
+						// Fenced: a rebalance moved the generation under us.
+						// Rejoin and resume — records since the last commit
+						// will be re-fetched (at-least-once).
+						mu.Lock()
+						fenced = true
+						mu.Unlock()
+						break
+					}
 					return fmt.Errorf("commit: %w", err)
 				}
 			}
 		}
 		if got == 0 && !sleep(ctx, 500*time.Millisecond) {
+			leave()
 			fmt.Printf("\nstopped; consumed %d records\n", total)
 			return nil
 		}

@@ -221,17 +221,31 @@ member.id 虽由 broker 下发，但**没有不可伪造性**：无认证环境�
 
 ### marchiq 对照
 
-v0 把两层都明确 defer 了，而且比 Kafka 更"裸"：
+安全两层（认证 + ACL）仍然 defer：member id 是自报的 query param，冒名没有
+成本；显式 offset 路径（`GET /fetch?topic=T&partition=P&offset=O`）也不经过
+group 机制 —— group 是协调便利，不是访问控制。但**协调协议本身在 Slice 7
+补齐了**（slice 4–6 的静态分配已删除）：
 
-- **member id 是自报的**（`member=m1` 只是个 query param），无 broker 下发、
-  无心跳、无会话、无 generation。冒名没有任何成本。
-- **显式 offset 路径完全敞开**：`GET /fetch?topic=T&partition=P&offset=O` 不
-  经过 group 机制 —— group 是协调便利，不是访问控制。
-- **静态分配下僵尸的表现**值得记住：member 真死 → 它名下的分区停滞（lag 增
-  长）但**不会重复**；假死（网络分区后旧进程还活着）→ 两个进程读同一分区 →
-  重复处理。at-least-once 容忍重复，但由于 commit 无 fencing，僵尸可以污染
-  group 的 committed offset —— 这正是 slice 5+ 若做 rebalance/动态 membership
-  时必须引入 generation 的原因。
+- **心跳 + 会话 + reaper**：member 周期心跳（`-sessionTimeout`，默认 10s），
+  停止心跳即被后台 reaper（`-groupReapInterval`，默认 1s）驱逐并触发
+  rebalance。会话是纯内存状态：broker 重启时给每个已持久化的 member 一个
+  完整 timeout 的宽限期 —— membership 持久、session 短暂，与 Kafka 同形。
+- **generation fencing 守写入口**：每次 membership 变化（join / leave /
+  超时驱逐）generation +1；`POST /commit` 必须携带当前 generation，旧
+  generation 的 commit 被 409 拒绝。上面 t0–t4 的僵尸时间线就是
+  `TestGroupZombieFencing`：m1 停止心跳 → reaper 驱逐 → generation +1 →
+  m1 用旧 generation commit 被挡下 → m2 用新 generation 提交成功。
+- **Fetch 不校验 generation**（与 Kafka 一致：重复读最多重复处理，下游幂等
+  可解），但 member 解析基于当前 live 列表 —— 被驱逐的僵尸 fetch 直接
+  member-not-found。
+- **rebalance = 在 live member 列表上全量重算**：index i 拥有 partition p
+  当且仅当 `i == p % len(members)`。客户端靠 heartbeat 响应（或 409 后的
+  rejoin）拉取新分配 —— pull, not push。被驱逐后同名 rejoin 是**新
+  join**（排到队尾），不是 Kafka static membership 用 instance.id 领回
+  原分配。
+- 仍然 defer：认证 / ACL、static membership（instance id）、incremental
+  cooperative rebalance（marchiq 每次变化全量重算，有 stop-the-world 窗
+  口）、broker 下发 member.id。
 
-安全（认证 + ACL）与教育 MVP 的定位无关，继续 defer；但"协调 ≠ 安全"这个区
-分本身就是要学的一课。
+"协调 ≠ 安全"这个区分依旧成立：这套协议只保证"**过期的**可信者不能捣乱"，
+不防冒名者。

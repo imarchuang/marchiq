@@ -92,10 +92,8 @@ func TestRetentionAgeAdvancesEarliest(t *testing.T) {
 func TestRetentionGroupClamp(t *testing.T) {
 	b, _ := newRetentionBroker(t, TopicConfig{Name: "events", Partitions: 1, RetentionMS: 60_000}, 20)
 	// segments: [0..3] [4..7] [8..11] [12..15] [16..19 active]
-	if _, err := b.JoinGroup("g1", "events", "", 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.CommitOffset("g1", "events", 0, 9); err != nil { // clamp B = 10
+	a := join(t, b, "g1", "events", "")
+	if err := b.CommitOffset("g1", "events", 0, 9, a.Generation); err != nil { // clamp B = 10
 		t.Fatal(err)
 	}
 	ageAllSegments(t, b, "events", 0, 2*time.Minute)
@@ -120,16 +118,12 @@ func TestRetentionGroupClamp(t *testing.T) {
 // The clamp is the MIN over joined groups: the slowest consumer pins retention.
 func TestRetentionClampIsMinAcrossGroups(t *testing.T) {
 	b, _ := newRetentionBroker(t, TopicConfig{Name: "events", Partitions: 1, RetentionMS: 60_000}, 20)
-	if _, err := b.JoinGroup("fast", "events", "", 1); err != nil {
+	fast := join(t, b, "fast", "events", "")
+	slow := join(t, b, "slow", "events", "")
+	if err := b.CommitOffset("fast", "events", 0, 19, fast.Generation); err != nil { // B = 20
 		t.Fatal(err)
 	}
-	if _, err := b.JoinGroup("slow", "events", "", 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.CommitOffset("fast", "events", 0, 19); err != nil { // B = 20
-		t.Fatal(err)
-	}
-	if err := b.CommitOffset("slow", "events", 0, 4); err != nil { // B = 5 wins
+	if err := b.CommitOffset("slow", "events", 0, 4, slow.Generation); err != nil { // B = 5 wins
 		t.Fatal(err)
 	}
 	ageAllSegments(t, b, "events", 0, 2*time.Minute)
@@ -147,9 +141,7 @@ func TestRetentionClampIsMinAcrossGroups(t *testing.T) {
 // is offset 0, so nothing on that partition may be deleted.
 func TestRetentionUncommittedGroupBlocksAll(t *testing.T) {
 	b, _ := newRetentionBroker(t, TopicConfig{Name: "events", Partitions: 1, RetentionMS: 60_000}, 10)
-	if _, err := b.JoinGroup("g1", "events", "", 1); err != nil {
-		t.Fatal(err)
-	}
+	join(t, b, "g1", "events", "")
 	ageAllSegments(t, b, "events", 0, 2*time.Minute)
 	deleted, err := b.EnforceRetention()
 	if err != nil || deleted != 0 {
@@ -225,9 +217,7 @@ func TestRetentionRestartPreservesEarliest(t *testing.T) {
 	if err != nil || off != (Offsets{Earliest: 8, Latest: 10}) {
 		t.Fatalf("after restart %+v %v", off, err)
 	}
-	if _, err := b2.JoinGroup("new", "events", "", 1); err != nil {
-		t.Fatal(err)
-	}
+	join(t, b2, "new", "events", "")
 	parts := fetchOffsets(t, b2, "new", "events", "")
 	if len(parts) != 1 || len(parts[0].Records) != 2 || parts[0].Records[0].Offset != 8 || parts[0].NextOffset != 10 {
 		t.Fatalf("%+v", parts)

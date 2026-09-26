@@ -19,7 +19,7 @@ import (
 	"github.com/marchi/marchiq/storage"
 )
 
-const helpText = `marchiq — Slice 6: polish (acks=0, broker-side partitioner, lag + stats, cmd/demo)
+const helpText = `marchiq — Slice 7: group protocol (heartbeat + generation fencing + rebalance)
 POST /topics                      create topic, JSON body {"name":"events","partitions":2,
                                   "retention_ms":3600000,"retention_bytes":1073741824}
                                   retention fields optional, zero = unlimited; a background
@@ -38,13 +38,29 @@ POST /produce?topic=T&partition=P&key=K&acks=A
 GET  /fetch?topic=T&partition=P&offset=O&max_bytes=B&max_records=N
                                   read records from offset O; key/value are base64 in JSON
 GET  /fetch?group=G&topic=T&member=M      group mode: read from committed+1 on assigned partitions
-POST /groups/{group}/join?topic=T&member=M&members=N
-                                  join group (N = declared size, fixed by first join); returns static assignment
-POST /commit                      commit offset, JSON body {"group":"g","topic":"t","partition":0,"offset":9}
+POST /groups/{group}/join?topic=T&member=M
+                                  join group; returns {generation, partitions}. Membership is
+                                  dynamic: the member at index i owns partition p iff
+                                  i == p % len(members), recomputed over the LIVE list, and the
+                                  generation bumps on every join/leave/eviction. Rejoining
+                                  after an eviction is a NEW join at the end of the order.
+                                  (the legacy members=N param is accepted and ignored)
+POST /groups/{group}/heartbeat?topic=T&member=M&generation=N
+                                  refresh the session (-sessionTimeout, default 10s); returns
+                                  the current {generation, partitions} — the client's rebalance
+                                  sensor. 409 = generation moved (resync/rejoin), 404 = the
+                                  member was evicted (rejoin from scratch)
+POST /groups/{group}/leave?topic=T&member=M
+                                  leave the group; the generation bumps and partitions
+                                  redistribute. The group and its committed offsets survive
+                                  the last member leaving (the retention clamp depends on them)
+POST /commit                      commit offset, JSON body {"group":"g","topic":"t","partition":0,
+                                  "offset":9,"generation":2} — generation is required (400 if
+                                  missing) and fenced: a stale (zombie) generation gets 409
 GET  /debug/segments?topic=T&partition=P  list segment files + sizes
-GET  /debug/lag[?group=G]         per joined (group,topic,partition): committed, next_fetch,
-                                  latest, lag = latest - next_fetch (negative when data loss
-                                  rewound LEO below the committed offset)
+GET  /debug/lag[?group=G]         per joined (group,topic,partition): generation, committed,
+                                  next_fetch, latest, lag = latest - next_fetch (negative when
+                                  data loss rewound LEO below the committed offset)
 GET  /debug/stats                 process-lifetime produce/fetch record + payload-byte counters
 GET  /healthz                     liveness
 `
@@ -65,6 +81,8 @@ func handler(api storage.BrokerAPI) http.Handler {
 	mux.HandleFunc("POST /produce", produce(api))
 	mux.HandleFunc("GET /fetch", fetch(api))
 	mux.HandleFunc("POST /groups/{group}/join", joinGroup(api))
+	mux.HandleFunc("POST /groups/{group}/heartbeat", heartbeat(api))
+	mux.HandleFunc("POST /groups/{group}/leave", leaveGroup(api))
 	mux.HandleFunc("POST /commit", commitOffset(api))
 	mux.HandleFunc("GET /debug/segments", debugSegments(api))
 	mux.HandleFunc("GET /debug/lag", debugLag(api))
@@ -277,9 +295,11 @@ func fetchGroup(api storage.BrokerAPI, w http.ResponseWriter, topic, group, memb
 	})
 }
 
-// joinGroup serves POST /groups/{group}/join?topic=T&member=M&members=N.
-// members (declared group size) defaults to 1 and is fixed by the first join;
-// member defaults to a generated id. Rejoining is idempotent.
+// joinGroup serves POST /groups/{group}/join?topic=T&member=M. Membership is
+// dynamic (Slice 7): every new member is appended to the join order and the
+// generation bumps; the response carries both. The legacy members=N param is
+// accepted and ignored — the declared-size model is gone. member defaults to
+// a generated id; rejoining while still a member is idempotent.
 func joinGroup(api storage.BrokerAPI) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -288,20 +308,9 @@ func joinGroup(api storage.BrokerAPI) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, "topic query param is required")
 			return
 		}
-		size := 1
-		if s := q.Get("members"); s != "" {
-			v, err := strconv.Atoi(s)
-			if err != nil || v < 1 {
-				writeErr(w, http.StatusBadRequest, "members must be a positive integer")
-				return
-			}
-			size = v
-		}
-		asg, err := api.JoinGroup(r.PathValue("group"), topic, q.Get("member"), size)
+		asg, err := api.JoinGroup(r.PathValue("group"), topic, q.Get("member"))
 		if err != nil {
 			switch {
-			case errors.Is(err, storage.ErrGroupConflict):
-				writeErr(w, http.StatusConflict, err.Error())
 			case errors.Is(err, storage.ErrTopicNotFound):
 				writeErr(w, http.StatusNotFound, err.Error())
 			default:
@@ -313,15 +322,80 @@ func joinGroup(api storage.BrokerAPI) http.HandlerFunc {
 	}
 }
 
+// heartbeat serves POST /groups/{group}/heartbeat?topic=T&member=M&generation=N.
+// It is the client's rebalance sensor: 200 returns the current generation and
+// the member's current assignment; 409 means the generation moved without this
+// member (rebalance — the error names the current generation); 404 means the
+// member is gone (evicted) and must rejoin from scratch.
+func heartbeat(api storage.BrokerAPI) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		topic, member := q.Get("topic"), q.Get("member")
+		if topic == "" || member == "" {
+			writeErr(w, http.StatusBadRequest, "topic and member query params are required")
+			return
+		}
+		generation, err := strconv.Atoi(q.Get("generation"))
+		if err != nil || generation < 0 {
+			writeErr(w, http.StatusBadRequest, "generation query param must be a non-negative integer")
+			return
+		}
+		res, err := api.Heartbeat(r.PathValue("group"), topic, member, generation)
+		if err != nil {
+			switch {
+			case errors.Is(err, storage.ErrGenerationFence):
+				writeErr(w, http.StatusConflict, err.Error())
+			case errors.Is(err, storage.ErrGroupNotFound), errors.Is(err, storage.ErrTopicNotFound):
+				writeErr(w, http.StatusNotFound, err.Error())
+			default:
+				writeErr(w, http.StatusInternalServerError, err.Error())
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	}
+}
+
+// leaveGroup serves POST /groups/{group}/leave?topic=T&member=M: the member
+// is removed, the generation bumps, and the survivors' assignments are
+// recomputed. The group and its committed offsets survive the last member
+// leaving.
+func leaveGroup(api storage.BrokerAPI) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		topic, member := q.Get("topic"), q.Get("member")
+		if topic == "" || member == "" {
+			writeErr(w, http.StatusBadRequest, "topic and member query params are required")
+			return
+		}
+		group := r.PathValue("group")
+		if err := api.LeaveGroup(group, topic, member); err != nil {
+			switch {
+			case errors.Is(err, storage.ErrGroupNotFound):
+				writeErr(w, http.StatusNotFound, err.Error())
+			default:
+				writeErr(w, http.StatusInternalServerError, err.Error())
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"group": group, "topic": topic, "member": member, "left": true})
+	}
+}
+
 type commitRequest struct {
 	Group     string `json:"group"`
 	Topic     string `json:"topic"`
 	Partition int    `json:"partition"`
 	Offset    int64  `json:"offset"`
+	// Generation is required and fenced; the pointer distinguishes "missing"
+	// (400) from a present-but-stale value (409).
+	Generation *int `json:"generation"`
 }
 
 // commitOffset serves POST /commit: the offset is the last PROCESSED record;
-// the next group fetch resumes at offset+1 (at-least-once).
+// the next group fetch resumes at offset+1 (at-least-once). The generation
+// must equal the group's current generation — the fence that keeps a zombie
+// member from clobbering the group's progress.
 func commitOffset(api storage.BrokerAPI) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req commitRequest
@@ -333,8 +407,14 @@ func commitOffset(api storage.BrokerAPI) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, "group and topic are required")
 			return
 		}
-		if err := api.CommitOffset(req.Group, req.Topic, req.Partition, storage.Offset(req.Offset)); err != nil {
+		if req.Generation == nil {
+			writeErr(w, http.StatusBadRequest, "generation is required")
+			return
+		}
+		if err := api.CommitOffset(req.Group, req.Topic, req.Partition, storage.Offset(req.Offset), *req.Generation); err != nil {
 			switch {
+			case errors.Is(err, storage.ErrGenerationFence):
+				writeErr(w, http.StatusConflict, err.Error())
 			case errors.Is(err, storage.ErrGroupNotFound),
 				errors.Is(err, storage.ErrTopicNotFound), errors.Is(err, storage.ErrPartitionNotFound):
 				writeErr(w, http.StatusNotFound, err.Error())
@@ -347,7 +427,7 @@ func commitOffset(api storage.BrokerAPI) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"group": req.Group, "topic": req.Topic, "partition": req.Partition,
-			"committed": req.Offset, "next_offset": req.Offset + 1,
+			"committed": req.Offset, "next_offset": req.Offset + 1, "generation": *req.Generation,
 		})
 	}
 }
@@ -462,6 +542,8 @@ func run() error {
 	segmentBytes := flag.Int64("segmentBytes", storage.DefaultMaxSegmentBytes, "roll active segment beyond this size")
 	indexInterval := flag.Int64("indexIntervalBytes", storage.DefaultIndexIntervalBytes, "sparse index entry per this many bytes")
 	retentionCheck := flag.Duration("retentionCheckInterval", storage.DefaultRetentionCheckInterval, "how often the retention janitor deletes expired sealed segments")
+	sessionTimeout := flag.Duration("sessionTimeout", storage.DefaultSessionTimeout, "group member session timeout: no heartbeat for this long and the reaper evicts the member")
+	reapInterval := flag.Duration("groupReapInterval", storage.DefaultGroupReapInterval, "how often the group reaper evicts expired members")
 	flag.Parse()
 	broker, err := storage.OpenWithConfig(*dataDir, *segmentBytes, *indexInterval)
 	if err != nil {
@@ -469,6 +551,8 @@ func run() error {
 	}
 	defer broker.Close()
 	broker.SetRetentionInterval(*retentionCheck)
+	broker.SetSessionTimeout(*sessionTimeout)
+	broker.SetGroupReapInterval(*reapInterval)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	server := &http.Server{Addr: *addr, Handler: handler(broker), ReadHeaderTimeout: 5 * time.Second}

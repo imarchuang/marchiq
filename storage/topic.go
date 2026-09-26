@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"time"
 )
 
 const catalogVersion = 1
@@ -48,6 +49,21 @@ func OpenWithConfig(dataDir string, maxSegmentBytes, indexIntervalBytes int64) (
 		retentionInterval:  DefaultRetentionCheckInterval,
 		retentionKick:      make(chan struct{}),
 		retentionStop:      make(chan struct{}),
+		sessionTimeout:     DefaultSessionTimeout,
+		reapInterval:       DefaultGroupReapInterval,
+		reapStop:           make(chan struct{}),
+	}
+	// Sessions are ephemeral, membership is durable (Slice 7): every loaded
+	// member gets LastSeen = now, a full session-timeout grace period to
+	// heartbeat before the reaper may evict it. A broker restart therefore
+	// never mass-evicts healthy consumers — same shape as Kafka.
+	now := time.Now()
+	for _, g := range groups {
+		for _, gt := range g.topics {
+			for _, m := range gt.Members {
+				gt.LastSeen[m] = now
+			}
+		}
 	}
 	for _, cfg := range meta.Topics {
 		t, err := b.openTopic(cfg)
@@ -57,10 +73,12 @@ func OpenWithConfig(dataDir string, maxSegmentBytes, indexIntervalBytes int64) (
 		}
 		b.topics[cfg.Name] = t
 	}
-	// The janitor starts only after every partition opened cleanly, so it can
-	// never run against a half-constructed broker.
+	// The janitor and the reaper start only after every partition opened
+	// cleanly, so they can never run against a half-constructed broker.
 	b.retentionWg.Add(1)
 	go b.retentionLoop()
+	b.reapWg.Add(1)
+	go b.groupReapLoop()
 	return b, nil
 }
 
@@ -299,10 +317,10 @@ func (b *Broker) DescribeSegments(topic string, partition int) ([]SegmentInfo, e
 	return p.DescribeSegments()
 }
 
-// Close marks the broker closed, stops the retention janitor, then closes each
-// partition. Partition locks serialize this against in-flight appends; new
-// operations see ErrClosed. gmu is taken so group operations observe closed
-// under the same lock they check.
+// Close marks the broker closed, stops the retention janitor and the group
+// reaper, then closes each partition. Partition locks serialize this against
+// in-flight appends; new operations see ErrClosed. gmu is taken so group
+// operations observe closed under the same lock they check.
 func (b *Broker) Close() error {
 	b.mu.Lock()
 	b.gmu.Lock()
@@ -315,11 +333,14 @@ func (b *Broker) Close() error {
 	topics := b.topics
 	b.gmu.Unlock()
 	b.mu.Unlock()
-	// Stop the janitor before closing segment files. An in-flight pass holds
-	// only partition locks (never mu/gmu while waiting here), so this cannot
-	// deadlock; after Wait returns no retention work is running.
+	// Stop the janitor and the reaper before closing segment files. An
+	// in-flight retention pass holds only partition locks and the reaper only
+	// gmu (never mu/gmu while waiting here), so this cannot deadlock; after
+	// the Waits return no background work is running.
 	close(b.retentionStop)
 	b.retentionWg.Wait()
+	close(b.reapStop)
+	b.reapWg.Wait()
 	var errs []error
 	for _, t := range topics {
 		for _, p := range t.partitions {
