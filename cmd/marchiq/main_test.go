@@ -323,7 +323,7 @@ func TestDebugLagAndStatsAPI(t *testing.T) {
 			t.Fatalf("produce p1: %d", w.Code)
 		}
 	}
-	if w := post("/commit", `{"group":"workers","topic":"events","partition":0,"offset":6}`); w.Code != 200 {
+	if w := post("/commit", `{"group":"workers","topic":"events","partition":0,"offset":6,"generation":1}`); w.Code != 200 {
 		t.Fatalf("commit: %d %s", w.Code, w.Body)
 	}
 	w := get("/debug/lag")
@@ -333,6 +333,7 @@ func TestDebugLagAndStatsAPI(t *testing.T) {
 	var lag struct {
 		Groups []struct {
 			Group      string   `json:"group"`
+			Generation int      `json:"generation"`
 			Members    []string `json:"members"`
 			Partitions []struct {
 				Partition int    `json:"partition"`
@@ -346,7 +347,7 @@ func TestDebugLagAndStatsAPI(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &lag); err != nil {
 		t.Fatal(err)
 	}
-	if len(lag.Groups) != 1 || lag.Groups[0].Group != "workers" ||
+	if len(lag.Groups) != 1 || lag.Groups[0].Group != "workers" || lag.Groups[0].Generation != 1 ||
 		len(lag.Groups[0].Members) != 1 || lag.Groups[0].Members[0] != "w1" ||
 		len(lag.Groups[0].Partitions) != 2 {
 		t.Fatalf("%s", w.Body)
@@ -376,5 +377,88 @@ func TestDebugLagAndStatsAPI(t *testing.T) {
 	w = get("/debug/stats")
 	if json.Unmarshal(w.Body.Bytes(), &stats) != nil || stats["fetch_records"] != 3 || stats["fetch_bytes"] != 3 {
 		t.Fatalf("%v", stats)
+	}
+}
+
+// Slice 7: the group protocol on the wire — join returns a generation, the
+// legacy members param is accepted and ignored, heartbeat fences stale
+// generations (409) and refreshes the session, leave redistributes, and
+// commit requires the current generation.
+func TestGroupProtocolAPI(t *testing.T) {
+	h := testHandler(t)
+	post := func(path, body string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", path, strings.NewReader(body)))
+		return w
+	}
+	if w := post("/topics", `{"name":"events","partitions":2}`); w.Code != 201 {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	for i := 0; i < 4; i++ {
+		if w := post("/produce?topic=events&partition=0", "v"); w.Code != 200 {
+			t.Fatalf("produce: %d", w.Code)
+		}
+	}
+	// Join returns the assignment AND the generation; members=3 is ignored.
+	w := post("/groups/workers/join?topic=events&member=w1&members=3", "")
+	if w.Code != 200 {
+		t.Fatalf("join: %d %s", w.Code, w.Body)
+	}
+	var asg struct {
+		Generation int   `json:"generation"`
+		Partitions []int `json:"partitions"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &asg); err != nil {
+		t.Fatal(err)
+	}
+	if asg.Generation != 1 || len(asg.Partitions) != 2 {
+		t.Fatalf("%+v", asg)
+	}
+	// Heartbeat: missing generation → 400; stale → 409; current → 200 with
+	// the assignment; unknown member → 404.
+	if w := post("/groups/workers/heartbeat?topic=events&member=w1", ""); w.Code != 400 {
+		t.Fatalf("heartbeat missing generation: %d", w.Code)
+	}
+	if w := post("/groups/workers/heartbeat?topic=events&member=w1&generation=7", ""); w.Code != 409 {
+		t.Fatalf("heartbeat stale generation: %d %s", w.Code, w.Body)
+	}
+	w = post("/groups/workers/heartbeat?topic=events&member=w1&generation=1", "")
+	if w.Code != 200 {
+		t.Fatalf("heartbeat: %d %s", w.Code, w.Body)
+	}
+	var hb struct {
+		Generation int   `json:"generation"`
+		Partitions []int `json:"partitions"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &hb); err != nil || hb.Generation != 1 || len(hb.Partitions) != 2 {
+		t.Fatalf("%+v %v", hb, err)
+	}
+	if w := post("/groups/workers/heartbeat?topic=events&member=ghost&generation=1", ""); w.Code != 404 {
+		t.Fatalf("heartbeat unknown member: %d", w.Code)
+	}
+	// Commit: missing generation → 400; stale → 409; current → 200.
+	if w := post("/commit", `{"group":"workers","topic":"events","partition":0,"offset":1}`); w.Code != 400 {
+		t.Fatalf("commit without generation: %d %s", w.Code, w.Body)
+	}
+	if w := post("/commit", `{"group":"workers","topic":"events","partition":0,"offset":1,"generation":7}`); w.Code != 409 {
+		t.Fatalf("commit stale generation: %d %s", w.Code, w.Body)
+	}
+	if w := post("/commit", `{"group":"workers","topic":"events","partition":0,"offset":1,"generation":1}`); w.Code != 200 {
+		t.Fatalf("commit: %d %s", w.Code, w.Body)
+	}
+	// Leave: unknown member → 404; a real leave bumps the generation, which
+	// fences the NEXT commit at the old one — even with zero members left,
+	// the group and its offsets survive.
+	if w := post("/groups/workers/leave?topic=events&member=ghost", ""); w.Code != 404 {
+		t.Fatalf("leave unknown member: %d", w.Code)
+	}
+	if w := post("/groups/workers/leave?topic=events&member=w1", ""); w.Code != 200 {
+		t.Fatalf("leave: %d %s", w.Code, w.Body)
+	}
+	if w := post("/commit", `{"group":"workers","topic":"events","partition":0,"offset":2,"generation":1}`); w.Code != 409 {
+		t.Fatalf("commit after leave: %d %s", w.Code, w.Body)
+	}
+	if w := post("/commit", `{"group":"workers","topic":"events","partition":0,"offset":2,"generation":2}`); w.Code != 200 {
+		t.Fatalf("commit new generation: %d %s", w.Code, w.Body)
 	}
 }

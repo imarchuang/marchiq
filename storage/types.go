@@ -20,10 +20,14 @@ var (
 	ErrPartitionNotFound = errors.New("partition not found")
 	ErrClosed            = errors.New("broker or partition is closed")
 	ErrOffsetOutOfRange  = errors.New("offset out of range")
-	// ErrGroupNotFound: the group (or its topic binding) does not exist; join first.
+	// ErrGroupNotFound: the group (or its topic binding, or the member in its
+	// live list) does not exist; join first.
 	ErrGroupNotFound = errors.New("consumer group not found")
-	// ErrGroupConflict: group full or declared size mismatch (v0 has no rebalance).
-	ErrGroupConflict = errors.New("consumer group conflict")
+	// ErrGenerationFence: the request carries a stale group generation — a
+	// membership change (join/leave/timeout-evict) happened since the caller
+	// learned it. Fencing guards the offset WRITE path (commits) and is how
+	// heartbeats tell a client to resync (docs/kafka-notes.md §3).
+	ErrGenerationFence = errors.New("generation fenced by a newer group generation")
 	// ErrMemberRequired: the group has several members; the caller must name one.
 	ErrMemberRequired = errors.New("member param required")
 	// ErrPartitionFenced rejects operations on a partition whose earlier
@@ -131,8 +135,10 @@ type BrokerAPI interface {
 	GetOffsets(topic string, partition int) (Offsets, error)
 	Fetch(topic string, partition int, offset Offset, maxRecords int, maxBytes int64) ([]Record, Offsets, error)
 	DescribeSegments(topic string, partition int) ([]SegmentInfo, error)
-	JoinGroup(group, topic, member string, size int) (Assignment, error)
-	CommitOffset(group, topic string, partition int, offset Offset) error
+	JoinGroup(group, topic, member string) (Assignment, error)
+	Heartbeat(group, topic, member string, generation int) (HeartbeatResult, error)
+	LeaveGroup(group, topic, member string) error
+	CommitOffset(group, topic string, partition int, offset Offset, generation int) error
 	FetchGroup(group, topic, member string, maxRecords int, maxBytes int64) ([]PartitionFetch, error)
 	GroupLag(group string) ([]GroupLag, error)
 	Stats() Stats
@@ -172,6 +178,16 @@ type Broker struct {
 	retentionKick     chan struct{}
 	retentionStop     chan struct{}
 	retentionWg       sync.WaitGroup
+
+	// Group sessions + reaper (Slice 7). sessionTimeout is how long a member
+	// may go without a heartbeat before ReapExpiredMembers evicts it;
+	// reapInterval is how often the background reaper runs one pass. Both are
+	// guarded by mu and re-read by the loop each tick, so the setters take
+	// effect without a restart; tests drive ReapExpiredMembers directly.
+	sessionTimeout time.Duration
+	reapInterval   time.Duration
+	reapStop       chan struct{}
+	reapWg         sync.WaitGroup
 
 	// Slice 6 stats counters. Atomics, never persisted, reset at Open.
 	produceRecords atomic.Int64

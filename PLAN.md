@@ -15,7 +15,8 @@ After the MVP you can explain, with a running binary and on-disk files:
 
 1. Why Kafka is a **log**, not an LSM (no per-key merge; retention deletes segments).
 2. How **topic → partition → offset** gives ordering and replay.
-3. How **consumer groups** shard partitions and commit offsets.
+3. How **consumer groups** shard partitions, commit offsets, and fence zombie
+   members (heartbeat + generation).
 4. What **durability** costs (page cache vs `fsync`, single broker vs replicas).
 
 ---
@@ -30,7 +31,7 @@ After the MVP you can explain, with a running binary and on-disk files:
 | Log segment | immutable file + sparse offset index | compaction topic (key→latest) |
 | Producer | append with optional ack wait | idempotent producer, txn |
 | Consumer | fetch by offset | isolation levels |
-| Consumer group | one active reader per partition | static membership, rebalance protocols |
+| Consumer group | one active reader per partition; heartbeat + generation fencing | static membership (instance ids), cooperative/incremental rebalance |
 | Retention | time and/or size per topic | tiered storage |
 | Broker | single process in v0 | cluster, replication, ISR |
 
@@ -128,8 +129,10 @@ Binary protocol can be slice 6+; HTTP keeps demos and tests simple.
 | GET | `/topics/{topic}/offsets` | earliest / latest per partition |
 | POST | `/produce` | `topic`, `partition` (`-1` = key hash / round-robin), `key`, `acks` (`0`\|`1`), `value` (body) |
 | GET | `/fetch` | `group`, `topic`, `max_bytes`, `timeout_ms` |
-| POST | `/commit` | `{group, topic, partition, offset}` |
-| POST | `/groups/{group}/join` | register member; returns partition assignment (v0 static) |
+| POST | `/commit` | `{group, topic, partition, offset, generation}` — generation required, fenced (409) |
+| POST | `/groups/{group}/join` | join; returns `{generation, partitions}` over the live member list |
+| POST | `/groups/{group}/heartbeat` | `topic`, `member`, `generation`; refreshes the session, returns current assignment; 409 = rebalance happened |
+| POST | `/groups/{group}/leave` | `topic`, `member`; removes the member, bumps the generation |
 | GET | `/` | help text |
 
 **Produce acks (v0):**
@@ -149,21 +152,33 @@ Default `acks=1` for demos; document the tradeoff in `DURABILITY.md`.
 
 ---
 
-## Consumer groups (v0 — intentionally small)
+## Consumer groups (dynamic membership + fencing)
 
-Kafka’s group coordinator is heavy. MVP rules (implemented in slice 4):
+Kafka’s group coordinator is heavy; marchiq keeps the protocol small but real
+(slice 7 replaced slice 4's static declared-size assignment):
 
-1. **Static assignment:** the first join declares the group size; members get an
-   ordinal by join order; partition `p` belongs to the member with
-   `ordinal == p % size`. No partition ever changes hands.
-2. **One committed offset per (group, topic, partition)** in `meta/groups.json`,
-   published with the same atomic protocol as the topic catalog
-   (tmp → sync → rename → sync dir).
-3. **No rebalance protocol** — a member beyond the declared size gets 409;
-   full rebalance is slice 5+.
-4. **At-least-once:** commit **after** processing; crash before commit → replay.
+1. **Dynamic membership over a live list:** members join in order; the member
+   at index `i` owns partition `p` iff `i == p % len(members)`. Joins append,
+   leaves/evictions remove, and assignments redistribute automatically. More
+   members than partitions → trailing members idle with an empty assignment.
+2. **Heartbeat + session timeout:** members heartbeat (`-sessionTimeout`,
+   default 10s); a background reaper (`-groupReapInterval`, default 1s)
+   evicts expired members. Sessions are in-memory only — a broker restart
+   grants every loaded member a fresh timeout's grace — while membership and
+   generation persist in `meta/groups.json`.
+3. **Generation fencing:** every membership change bumps the generation.
+   Commits (and heartbeats) carry a generation; stale ones are rejected
+   (409 / `ErrGenerationFence`). Fencing guards the offset WRITE path only —
+   fetches stay unfenced (docs/kafka-notes.md §3). Rejoining after eviction
+   is a NEW join at the end of the order (no static-membership reclaim).
+4. **One committed offset per (group, topic, partition)**, published with the
+   same atomic protocol as the topic catalog (tmp → sync → rename → sync
+   dir); offsets survive the last member leaving (the retention clamp depends
+   on them).
+5. **At-least-once:** commit **after** processing; crash before commit → replay.
 
-This is enough to demo “two consumers, two partitions, no duplicate partition”.
+This demos “two consumers, two partitions, no duplicate partition” — and a
+paused consumer being fenced out of the group.
 
 ---
 
@@ -267,6 +282,43 @@ commit, and resumes at the first offset past the cursor; stats counters move
 and reset at restart; HTTP coverage for acks/-1/400s, /debug/lag schema,
 /debug/stats.
 
+### Slice 7 — group protocol (heartbeat + fencing + rebalance)
+
+- Dynamic membership replaces slice 4's declared-size static assignment:
+  `groupTopic` is `{members (join order), generation, offsets}` plus an
+  in-memory-only `lastSeen`; assignment is recomputed over the live list on
+  every change (`i == p % len(members)`), and the generation bumps on every
+  join/leave/eviction. The legacy `members=N` join param is accepted and
+  ignored.
+- `POST /groups/{g}/heartbeat?topic=T&member=M&generation=N` refreshes the
+  session and returns the current `{generation, partitions}` — the client's
+  rebalance sensor (409 = generation moved, resync; 404 = evicted, rejoin).
+  `POST /groups/{g}/leave?topic=T&member=M` removes a member; the group and
+  its committed offsets survive the last member leaving.
+- Generation fencing guards the offset write path: `POST /commit` requires
+  `"generation"` (400 if missing, 409 if stale). Fetches stay unfenced but
+  resolve members over the CURRENT live list, so an evicted zombie's fetch
+  fails member-not-found.
+- Reaper: `Broker.ReapExpiredMembers(now)` is the deterministic single pass
+  the tests drive; the ticker (`-groupReapInterval`, default 1s) mirrors the
+  retention janitor. `-sessionTimeout` default 10s. Sessions are in-memory:
+  Open grants every loaded member a full timeout's grace.
+- `meta/groups.json` envelope v2 (`generation` per binding, `size` dropped);
+  v1 files migrate on load (join order kept, generation := 1).
+- `cmd/demo` consume is a Kafka-client-shaped loop: heartbeat goroutine at
+  sessionTimeout/3, commits carry the generation, 409/404 → rejoin → resume,
+  LeaveGroup on shutdown.
+
+**Tests:** the kafka-notes §3 zombie timeline end-to-end (evict → old
+generation fenced → new generation commits → rejoin appends at the end);
+heartbeat refresh / not-found / fence names the current generation; leave
+redistributes and the last member keeps offsets (retention clamp still
+enforced); restart keeps members + generation + offsets with sessions reset
+(no mass-eviction, heartbeats work); more members than partitions idle;
+commit without generation rejected (HTTP 400, storage fence on stale);
+groups.json v1→v2 migration and unknown-version refusal; slice-4 tests
+ported to live-member semantics.
+
 ---
 
 ## Durability decisions (document early)
@@ -337,16 +389,23 @@ docker compose up
 curl -X POST localhost:9092/topics -d '{"name":"events","partitions":2}'
 go run ./cmd/demo -mode produce -topic events -n 100 -keys 10
 
-# terminal 3+4 — two-member consumer group (static assignment, one partition each)
-go run ./cmd/demo -mode consume -topic events -group workers -member w1 -members 2
-go run ./cmd/demo -mode consume -topic events -group workers -member w2 -members 2
+# terminal 3+4 — two-member consumer group (dynamic assignment, one partition
+# each; both heartbeat in the background and commit with the generation)
+go run ./cmd/demo -mode consume -topic events -group workers -member w1
+go run ./cmd/demo -mode consume -topic events -group workers -member w2
 
-# lag drains to zero; counters moved
+# lag drains to zero; counters moved; the generation is visible per group
 curl localhost:9092/debug/lag?group=workers
 curl localhost:9092/debug/stats
 
+# zombie fencing: kill -STOP the w1 consumer (heartbeats stop); within one
+# session timeout the reaper evicts it (broker log line), w2's heartbeat picks
+# up BOTH partitions, and the generation bumps. kill -CONT wakes w1: its
+# in-flight commit is fenced (409), so it rejoins at the end of the order and
+# resumes — watch the join lines in both terminals.
+
 # at-least-once replay: a -noCommit consumer restarted re-reads everything
-go run ./cmd/demo -mode consume -topic events -group workers -member w1 -members 2 -noCommit
+go run ./cmd/demo -mode consume -topic events -group workers -member w1 -noCommit
 
 # acks=0 vs crash: produce with -acks 0, then simulate an OS crash (kill -9
 # alone keeps the kernel page cache — see storage/DURABILITY.md); LEO can
@@ -382,7 +441,7 @@ another LSM.
 | HTTP vs Kafka protocol | HTTP | slice 6+ if wire compat needed |
 | Key hashing to partition | `hash(key) % N` if partition omitted | sticky partitioner |
 | Segment index interval | every 4 KiB | large messages |
-| Group rebalance | static / single member | slice 5 multi-member |
+| Group rebalance | eager rebalance over the live member list (slice 7) | cooperative/incremental protocols, static membership |
 | CRC per record | optional magic byte | corruption detection slice |
 
 ---
